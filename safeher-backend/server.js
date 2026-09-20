@@ -1,42 +1,38 @@
 require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
+const http = require("http");
+const mongoose = require("mongoose");
+const app = require("./src/app");
+const { createSocketServer } = require("./src/socket");
+const PoliceStation = require("./src/models/PoliceStation");
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const port = Number(process.env.PORT || 3000);
+const server = http.createServer(app);
+const io = createSocketServer(server);
+app.set("io", io);
 
-app.post("/make-call", async (req, res) => {
-    const { to } = req.body;
+async function start() {
+  if (process.env.MONGO_URI) {
     try {
-        const response = await fetch("https://voice-agent.edesy.in/api/v1/calls", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${process.env.EDESY_API_KEY}`,
-            },
-            body: JSON.stringify({
-                phoneNumber: to,
-                agentId: process.env.EDESY_AGENT_ID,
-            }),
-        });
-        const data = await response.json();
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+      await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 });
+      await PoliceStation.createIndexes();
+    } catch (error) {
+      const canStartWithoutDatabase = process.env.NODE_ENV !== "production" && process.env.ALLOW_START_WITHOUT_DB === "true";
+      if (!canStartWithoutDatabase) {
+        console.error("MongoDB connection failed.");
+        console.error("For MongoDB Atlas, add this machine's public IP under Security > Database & Network Access > IP Access List.");
+        console.error("Then verify the username/password and URL-encoded special characters in MONGO_URI.");
+        throw error;
+      }
+      console.warn("MongoDB is unavailable; starting in UI-only mode because ALLOW_START_WITHOUT_DB=true.");
     }
-});
-// NEW — location SMS
-app.post("/send-sms", async (req, res) => {
-    const { phone, message } = req.body;
-    try {
-        const url = `https://www.fast2sms.com/dev/bulkV2?authorization=${process.env.FAST2SMS_API_KEY}&route=q&message=${encodeURIComponent(message)}&language=english&flash=0&numbers=${phone}`;
-        const response = await fetch(url, { method: "GET" });
-        const data = await response.json();
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.listen(3000, () => console.log("Backend running on port 3000"));
+  } else if (process.env.NODE_ENV === "production") {
+    throw new Error("MONGO_URI is required in production.");
+  } else {
+    console.warn("MONGO_URI is not configured; starting without database access.");
+  }
+  server.listen(port, () => console.log(`SafeHer backend listening on ${port}`));
+}
+if (require.main === module) {
+  start().catch((error) => { console.error("Unable to start server:", error); process.exit(1); });
+}
+module.exports = { app, server, start };

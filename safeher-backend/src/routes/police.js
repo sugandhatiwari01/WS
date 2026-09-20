@@ -1,0 +1,16 @@
+const express = require("express");
+const { body, validationResult } = require("express-validator");
+const { requireAuth, requireRole } = require("../middleware/auth");
+const Emergency = require("../models/Emergency");
+const EmergencyEvent = require("../models/EmergencyEvent");
+const router = express.Router();
+router.use(requireAuth, requireRole("police", "responder", "admin"));
+const find = (id) => ({ $or: [{ _id: id }, { emergencyId: id }] });
+router.get("/incidents", async (req, res, next) => { try { res.json(await Emergency.find({ status: { $nin: ["RESOLVED", "CANCELLED", "FALSE_ALARM"] } }).sort({ level: -1, createdAt: 1 })); } catch (e) { next(e); } });
+router.get("/incidents/:id", async (req, res, next) => { try { const item = await Emergency.findOne(find(req.params.id)); if (!item) return res.status(404).json({ error: "Incident not found" }); res.json(item); } catch (e) { next(e); } });
+router.post("/incidents/:id/claim", async (req, res, next) => { try { const item = await Emergency.findOneAndUpdate({ ...find(req.params.id), assignedOfficerId: null, status: { $in: ["CREATED", "DISPATCHED", "VIEWED"] } }, { $set: { assignedOfficerId: req.user._id, responder: req.user._id, status: "ASSIGNED", claimedAt: new Date() } }, { new: true }); if (!item) return res.status(409).json({ error: "CASE_ALREADY_CLAIMED" }); await EmergencyEvent.create({ emergencyId: item._id, actorId: req.user._id, type: "CLAIMED" }); req.app.get("io")?.to(`emergency:${item._id}`).emit("incident:claimed", item); res.json(item); } catch (e) { next(e); } });
+const transition = (from, to) => async (req, res, next) => { try { const item = await Emergency.findOneAndUpdate({ ...find(req.params.id), assignedOfficerId: req.user._id, status: from }, { $set: { status: to, ...(to === "RESOLVED" ? { resolvedAt: new Date() } : {}) } }, { new: true }); if (!item) return res.status(409).json({ error: "INVALID_STATE_TRANSITION" }); await EmergencyEvent.create({ emergencyId: item._id, actorId: req.user._id, type: to }); req.app.get("io")?.to(`emergency:${item._id}`).emit(`incident:${to.toLowerCase().replace("_", "-")}`, item); res.json(item); } catch (e) { next(e); } };
+router.post("/incidents/:id/respond", transition("ASSIGNED", "RESPONDING"));
+router.post("/incidents/:id/on-scene", transition("RESPONDING", "ON_SCENE"));
+router.post("/incidents/:id/resolve", transition("ON_SCENE", "RESOLVED"));
+module.exports = router;

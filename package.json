@@ -1,0 +1,15 @@
+{
+  "name": "safeher-workspace",
+  "private": true,
+  "scripts": {
+    "start": "npm --prefix women-safety run start",
+    "mobile": "npm --prefix women-safety run start",
+    "web": "npm --prefix women-safety run web",
+    "android": "npm --prefix women-safety run android",
+    "ios": "npm --prefix women-safety run ios",
+    "mobile:typecheck": "npm --prefix women-safety run typecheck",
+    "mobile:lint": "npm --prefix women-safety run lint",
+    "backend": "npm --prefix safeher-backend run start",
+    "backend:test": "npm --prefix safeher-backend test"
+  }
+}

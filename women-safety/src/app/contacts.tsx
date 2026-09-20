@@ -1,285 +1,79 @@
-import React, { useEffect, useState } from "react";
-import {
-  StyleSheet,
-  Text,
-  View,
-  TextInput,
-  Pressable,
-  Alert,
-} from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-
-type Contact = {
-  name: string;
-  phone: string;
-};
-
-const CONTACTS_KEY = "safeher_trusted_contacts";
+import { router } from "expo-router";
+import { useEffect, useState } from "react";
+import { Alert, Pressable, ScrollView, Text, TextInput } from "react-native";
+import { Action, Card, Header } from "@/components/ui";
+import { Contact, getContacts, saveContacts } from "@/lib/storage";
+import { api, post } from "@/lib/api";
+import { styles } from "@/lib/theme";
 
 export default function ContactsScreen() {
-  const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
+  const [email, setEmail] = useState("");
+  const [relationship, setRelationship] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [foundUser, setFoundUser] = useState<{ _id: string; name: string; email: string; phone?: string } | null>(null);
   const [contacts, setContacts] = useState<Contact[]>([]);
 
-  // LOAD SAVED CONTACTS
   useEffect(() => {
-    const loadContacts = async () => {
-      try {
-        const savedContacts = await AsyncStorage.getItem(
-          CONTACTS_KEY
-        );
-
-        if (savedContacts) {
-          setContacts(JSON.parse(savedContacts));
-        }
-      } catch (error) {
-        console.log("Error loading contacts:", error);
+    getContacts().then(setContacts);
+    api<{ _id: string; name: string; phone?: string; email?: string }[]>("/api/contacts").then(async (result) => {
+      if (result.data) {
+        const synced = result.data.map((item) => ({ id: item._id, name: item.name, phone: item.phone, email: item.email }));
+        await saveContacts(synced);
+        setContacts(synced);
       }
-    };
-
-    loadContacts();
+    });
   }, []);
 
-  // SAVE CONTACTS
-  const saveContacts = async (newContacts: Contact[]) => {
-    try {
-      await AsyncStorage.setItem(
-        CONTACTS_KEY,
-        JSON.stringify(newContacts)
-      );
-
-      setContacts(newContacts);
-    } catch (error) {
-      console.log("Error saving contacts:", error);
-    }
+  const searchUser = async () => {
+    if (!email.trim().includes("@")) return Alert.alert("Enter an email", "Search using the exact email used to register.");
+    setSearching(true);
+    const result = await api<{ _id: string; name: string; email: string; phone?: string }>(`/api/contacts/search?email=${encodeURIComponent(email.trim().toLowerCase())}`);
+    setSearching(false);
+    if (result.data) setFoundUser(result.data);
+    else Alert.alert("User not found", result.error === "REGISTERED_USER_NOT_FOUND" ? "No active USER account uses that email." : result.error || "Unable to search right now.");
   };
 
-  // ADD CONTACT
-  const addContact = () => {
-    if (!name.trim() || !phone.trim()) {
-      Alert.alert(
-        "Missing information",
-        "Please enter both name and phone number."
-      );
-      return;
-    }
-
-    const newContact = {
-      name: name.trim(),
-      phone: phone.trim(),
-    };
-
-    const newContacts = [
-      ...contacts,
-      newContact,
-    ];
-
-    saveContacts(newContacts);
-
-    setName("");
-    setPhone("");
+  const addContact = async () => {
+    if (!foundUser) return;
+    const result = await post<{ _id: string; name: string; email: string; phone?: string }>("/api/contacts", { email: foundUser.email, relationship: relationship.trim() || undefined }, true);
+    if (result.data) {
+      const next = [...contacts, { id: result.data._id, name: result.data.name, phone: result.data.phone, email: result.data.email }];
+      await saveContacts(next);
+      setContacts(next);
+      setFoundUser(null);
+      setEmail("");
+      setRelationship("");
+    } else if (!result.offline) Alert.alert("Could not add contact", result.error || "The user could not be added.");
+    setEmail("");
   };
 
-  // DELETE CONTACT
-  const deleteContact = (index: number) => {
-    Alert.alert(
-      "Delete Contact",
-      `Remove ${contacts[index].name} from trusted contacts?`,
-      [
-        {
-          text: "Cancel",
-          style: "cancel",
-        },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: () => {
-            const newContacts = contacts.filter(
-              (_, i) => i !== index
-            );
+  const removeContact = (contact: Contact) => Alert.alert("Remove contact?", `Remove ${contact.name} from your safety network?`, [
+    { text: "Cancel", style: "cancel" },
+    { text: "Remove", style: "destructive", onPress: async () => {
+      const next = contacts.filter((item) => item.id !== contact.id);
+      await saveContacts(next);
+      setContacts(next);
+      if (/^[a-f\d]{24}$/i.test(contact.id)) {
+        const result = await api(`/api/contacts/${contact.id}`, { method: "DELETE" });
+        if (result.error) Alert.alert("Contact removed locally", result.error);
+      }
+    } },
+  ]);
 
-            saveContacts(newContacts);
-          },
-        },
-      ]
-    );
-  };
-
-  return (
-    <View style={styles.container}>
-
-      <Text style={styles.title}>
-        Trusted Contacts
-      </Text>
-
-      <Text style={styles.subtitle}>
-        People SAFEHER can contact during an emergency
-      </Text>
-
-      {/* ADD CONTACT */}
-
-      <View style={styles.form}>
-
-        <TextInput
-          style={styles.input}
-          placeholder="Name"
-          placeholderTextColor="#777"
-          value={name}
-          onChangeText={setName}
-        />
-
-        <TextInput
-          style={styles.input}
-          placeholder="Phone number"
-          placeholderTextColor="#777"
-          keyboardType="phone-pad"
-          value={phone}
-          onChangeText={setPhone}
-        />
-
-        <Pressable
-          style={styles.addButton}
-          onPress={addContact}
-        >
-          <Text style={styles.addText}>
-            + ADD CONTACT
-          </Text>
-        </Pressable>
-
-      </View>
-
-      {/* CONTACT LIST */}
-
-      <View style={styles.list}>
-
-        {contacts.length === 0 ? (
-
-          <Text style={styles.empty}>
-            No trusted contacts added yet.
-          </Text>
-
-        ) : (
-
-          contacts.map((contact, index) => (
-
-            <View
-              key={index}
-              style={styles.contactCard}
-            >
-
-              <View>
-                <Text style={styles.contactName}>
-                  {contact.name}
-                </Text>
-
-                <Text style={styles.contactPhone}>
-                  📞 {contact.phone}
-                </Text>
-              </View>
-
-              <Pressable
-                onPress={() => deleteContact(index)}
-              >
-                <Text style={styles.delete}>
-                  DELETE
-                </Text>
-              </Pressable>
-
-            </View>
-
-          ))
-
-        )}
-
-      </View>
-
-    </View>
-  );
+  return <ScrollView style={styles.safe} contentContainerStyle={styles.container}>
+    <Header title="Trusted contacts" subtitle="People who can be contacted when you need help." />
+    <Card>
+      <Text style={styles.subtitle}>Search for another registered USER by their unique email, then add them.</Text>
+      <TextInput style={styles.input} placeholder="Registered user's email" value={email} onChangeText={(value) => { setEmail(value); setFoundUser(null); }} autoCapitalize="none" keyboardType="email-address" />
+      <Action label={searching ? "Searching..." : "Search user"} onPress={searchUser} />
+      {foundUser ? <><Text style={{ fontWeight: "800", fontSize: 17 }}>{foundUser.name}</Text><Text style={styles.subtitle}>{foundUser.email}</Text><TextInput style={styles.input} placeholder="Relationship (optional)" value={relationship} onChangeText={setRelationship} /><Action label="Add as trusted contact" onPress={addContact} /></> : null}
+    </Card>
+    {contacts.length === 0 ? <Card><Text style={styles.subtitle}>No trusted contacts yet. Add someone you trust above.</Text></Card> :
+      contacts.map((contact) => <Card key={contact.id}>
+        <Text style={{ fontWeight: "800", fontSize: 17 }}>{contact.name}</Text>
+        <Text style={styles.subtitle}>{contact.email || contact.phone}</Text>
+        <Pressable onPress={() => removeContact(contact)}><Text style={{ color: "#D92D20", fontWeight: "700", marginTop: 12 }}>Remove</Text></Pressable>
+      </Card>)}
+    <Action label="Back to settings" secondary onPress={() => router.back()} />
+  </ScrollView>;
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#0D0D0D",
-    paddingTop: 70,
-    paddingHorizontal: 20,
-  },
-
-  title: {
-    color: "white",
-    fontSize: 28,
-    fontWeight: "bold",
-  },
-
-  subtitle: {
-    color: "#AAAAAA",
-    fontSize: 14,
-    marginTop: 8,
-    lineHeight: 20,
-  },
-
-  form: {
-    marginTop: 30,
-  },
-
-  input: {
-    backgroundColor: "#1C1C1E",
-    color: "white",
-    paddingVertical: 14,
-    paddingHorizontal: 15,
-    borderRadius: 10,
-    marginBottom: 12,
-    fontSize: 16,
-  },
-
-  addButton: {
-    backgroundColor: "#E53935",
-    paddingVertical: 14,
-    borderRadius: 10,
-    alignItems: "center",
-  },
-
-  addText: {
-    color: "white",
-    fontWeight: "bold",
-    fontSize: 15,
-  },
-
-  list: {
-    marginTop: 30,
-  },
-
-  empty: {
-    color: "#777",
-    textAlign: "center",
-    marginTop: 20,
-  },
-
-  contactCard: {
-    backgroundColor: "#1C1C1E",
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-
-  contactName: {
-    color: "white",
-    fontSize: 17,
-    fontWeight: "bold",
-  },
-
-  contactPhone: {
-    color: "#AAAAAA",
-    marginTop: 6,
-    fontSize: 14,
-  },
-
-  delete: {
-    color: "#E53935",
-    fontSize: 12,
-    fontWeight: "bold",
-  },
-});
