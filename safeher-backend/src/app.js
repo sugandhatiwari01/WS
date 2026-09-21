@@ -1,5 +1,4 @@
 const express = require("express");
-const mongoose = require("mongoose");
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
@@ -11,13 +10,14 @@ const contacts = require("./routes/contacts");
 const police = require("./routes/police");
 const users = require("./routes/users");
 const { notFound, errorHandler } = require("./middleware/errors");
+const { isConfigured } = require("./db/supabase");
 
 const app = express();
 const requireDatabase = (req, res, next) => {
-  if (mongoose.connection.readyState === 1) return next();
+  if (isConfigured) return next();
   return res.status(503).json({
     error: "DATABASE_UNAVAILABLE",
-    message: "MongoDB is not connected. Check the backend MONGO_URI, Atlas network access, and DNS/VPN."
+    message: "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
   });
 };
 app.use(helmet());

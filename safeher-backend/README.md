@@ -11,7 +11,13 @@ npm install
 Copy-Item .env.example .env
 ```
 
-Set a long random `JWT_SECRET` and a reachable `MONGO_URI` in `.env`.
+Create a Supabase project, run [`supabase/schema.sql`](supabase/schema.sql) in
+the Supabase SQL editor, and set `SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY` in `.env`. Keep the service-role key server-side.
+Also set a long random `JWT_SECRET`.
+
+The schema creates the private `emergency-audio` storage bucket. Police audio
+links are returned as one-hour signed URLs.
 
 ## Run
 
@@ -21,14 +27,12 @@ npm run dev
 npm start
 ```
 
-If Atlas reports `MongooseServerSelectionError`, add the machine's public IP in
-Atlas **Security → Database & Network Access → IP Access List**, confirm the
-database user credentials, and URL-encode special characters in the password.
-For local UI-only work (not API/auth/emergency functionality), set
-`ALLOW_START_WITHOUT_DB=true` in development. Never enable that setting in
-production.
+The backend uses Supabase's HTTPS API, so MongoDB network access and Atlas DNS
+configuration are no longer required. For local UI-only work (not API/auth/
+emergency functionality), set `ALLOW_START_WITHOUT_DB=true` in development.
+Never enable that setting in production.
 
-Create the initial administrator after MongoDB is available:
+Create the initial administrator after Supabase is configured:
 
 ```powershell
 npm run seed

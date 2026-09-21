@@ -1,9 +1,8 @@
 require("dotenv").config();
 const http = require("http");
-const mongoose = require("mongoose");
 const app = require("./src/app");
 const { createSocketServer } = require("./src/socket");
-const PoliceStation = require("./src/models/PoliceStation");
+const { client, isConfigured } = require("./src/db/supabase");
 
 const port = Number(process.env.PORT || 3000);
 const server = http.createServer(app);
@@ -11,24 +10,22 @@ const io = createSocketServer(server);
 app.set("io", io);
 
 async function start() {
-  if (process.env.MONGO_URI) {
+  if (isConfigured) {
     try {
-      await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 10000 });
-      await PoliceStation.createIndexes();
+      const { error } = await client.from("app_documents").select("id").limit(1);
+      if (error) throw error;
     } catch (error) {
       const canStartWithoutDatabase = process.env.NODE_ENV !== "production" && process.env.ALLOW_START_WITHOUT_DB === "true";
       if (!canStartWithoutDatabase) {
-        console.error("MongoDB connection failed.");
-        console.error("For MongoDB Atlas, add this machine's public IP under Security > Database & Network Access > IP Access List.");
-        console.error("Then verify the username/password and URL-encoded special characters in MONGO_URI.");
+        console.error("Supabase connection failed. Check SUPABASE_URL, the service-role key, and that supabase/schema.sql has been applied.");
         throw error;
       }
-      console.warn("MongoDB is unavailable; starting in UI-only mode because ALLOW_START_WITHOUT_DB=true.");
+      console.warn("Supabase is unavailable; starting in UI-only mode because ALLOW_START_WITHOUT_DB=true.");
     }
   } else if (process.env.NODE_ENV === "production") {
-    throw new Error("MONGO_URI is required in production.");
+    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required in production.");
   } else {
-    console.warn("MONGO_URI is not configured; starting without database access.");
+    console.warn("Supabase is not configured; starting without database access.");
   }
   server.listen(port, () => console.log(`SafeHer backend listening on ${port}`));
 }

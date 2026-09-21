@@ -57,7 +57,7 @@ export async function api<T>(
       ...options,
       headers: {
         "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(token ? { Authorization: "Bearer " + token } : {}),
         ...(options.headers || {}),
       },
     });
@@ -74,6 +74,21 @@ export async function api<T>(
 
 export function post<T>(path: string, body: unknown, queueOffline = false) {
   return api<T>(path, { method: "POST", body: JSON.stringify(body) }, queueOffline);
+}
+
+export async function uploadAudio<T>(path: string, uri: string) {
+  if (!API_URL) return { offline: true, error: "Backend URL is not configured." } as ApiResult<T>;
+  const token = await getToken();
+  const form = new FormData();
+  form.append("audio", { uri, name: `evidence-${Date.now()}.m4a`, type: "audio/m4a" } as unknown as Blob);
+  try {
+    const response = await fetch(`${API_URL}${path}`, { method: "POST", headers: token ? { Authorization: "Bearer " + token } : {}, body: form });
+    const payload = await response.json().catch(() => undefined);
+    if (!response.ok) return { offline: false, status: response.status, error: payload?.error || `Request failed (${response.status})` };
+    return { offline: false, status: response.status, data: payload as T };
+  } catch {
+    return { offline: true, error: "Unable to upload the recording." };
+  }
 }
 
 export async function flushQueue() {
