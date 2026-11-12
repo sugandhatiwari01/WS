@@ -1,7 +1,18 @@
 import { Stack } from "expo-router";
-import { AuthProvider } from "@/lib/auth";
+import { AuthProvider, useAuth } from "@/lib/auth";
+import { SosProvider } from "@/hooks/useSos";
 
-export default function RootLayout() {
-  return <AuthProvider><Stack screenOptions={{ headerShown: false }} /></AuthProvider>;
+function SessionProviders({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return <SosProvider key={user?._id ?? "signed-out"}>{children}</SosProvider>;
 }
 
+export default function RootLayout() {
+  return (
+    <AuthProvider>
+      <SessionProviders>
+        <Stack screenOptions={{ headerShown: false }} />
+      </SessionProviders>
+    </AuthProvider>
+  );
+}

@@ -1,32 +1,166 @@
+/**
+ * Family dashboard screen
+ *
+ * Shows active/recent emergencies from contacts who have added the current user
+ * as a trusted contact. Real-time via Socket.IO, with 15 s polling fallback.
+ */
+
 import { router } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
-import { Text, View } from "react-native";
-import { Action, Card, Header } from "@/components/ui";
+import { Linking, ScrollView, Text, View } from "react-native";
+import { Action, Badge, Card, Divider, EmptyState, Header, StatusBanner } from "@/components/ui";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import { useSocket } from "@/hooks/useSocket";
 import { colors, styles } from "@/lib/theme";
 
-type Contact = { _id: string; name: string; phone: string };
-type Emergency = { _id: string; emergencyId?: string; level?: string; status?: string; createdAt?: string };
+type Emergency = {
+  _id: string;
+  emergencyId?: string;
+  level?: string;
+  status?: string;
+  createdAt?: string;
+  currentLocation?: { latitude?: number; longitude?: number } | null;
+  initialLocation?: { latitude?: number; longitude?: number } | null;
+  userId?: string;
+};
 
-export default function Family() {
-  const [contacts, setContacts] = useState<Contact[]>([]);
-  const [error, setError] = useState("");
+function statusVariant(status?: string): "danger" | "warning" | "success" | "neutral" {
+  if (!status) return "neutral";
+  if (["CREATED", "DISPATCHED", "VIEWED", "ASSIGNED"].includes(status)) return "danger";
+  if (["RESPONDING", "ON_SCENE"].includes(status)) return "warning";
+  if (["RESOLVED", "CANCELLED", "FALSE_ALARM"].includes(status)) return "success";
+  return "neutral";
+}
+
+function elapsedSince(isoDate?: string): string {
+  if (!isoDate) return "";
+  const diff = Math.floor((Date.now() - new Date(isoDate).getTime()) / 1000);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
+}
+
+function getMapUrl(emergency: Emergency): string | null {
+  const loc = emergency.currentLocation || emergency.initialLocation;
+  if (loc?.latitude != null && loc?.longitude != null) {
+    return `https://maps.google.com/?q=${loc.latitude},${loc.longitude}`;
+  }
+  return null;
+}
+
+export default function FamilyScreen() {
+  const { user } = useAuth();
   const [emergencies, setEmergencies] = useState<Emergency[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
   const load = useCallback(async () => {
-    const result = await api<Contact[]>("/api/family");
-    if (result.data) setContacts(result.data);
-    else setError(result.error || "Unable to load your family circle.");
-    const alerts = await api<Emergency[]>("/api/family/emergencies");
-    if (alerts.data) setEmergencies(alerts.data);
+    const result = await api<Emergency[]>("/api/family/emergencies");
+    if (result.data) {
+      setEmergencies(result.data);
+      setError("");
+    } else {
+      setError(result.error || "Unable to load alerts.");
+    }
+    setLoading(false);
   }, []);
-  useEffect(() => { const timer = setTimeout(() => { void load(); }, 0); return () => clearTimeout(timer); }, [load]);
-  return <View style={[styles.safe, styles.container]}>
-    <Header title="Family dashboard" subtitle="Your circle's safety status, in one place." />
-    {error ? <Card><Text style={{ color: colors.red }}>{error}</Text><Action label="Retry" secondary onPress={load} /></Card> : null}
-    {contacts.length === 0 && !error ? <Card><Text style={styles.subtitle}>No family contacts are linked to this account yet.</Text></Card> :
-      contacts.map((contact) => <Card key={contact._id}><Text style={{ fontWeight: "800", fontSize: 18 }}>{contact.name}</Text><Text style={styles.subtitle}>{contact.phone}</Text><Text style={{ color: colors.green, marginTop: 8, fontWeight: "700" }}>Connected</Text><Action label="View details & map" onPress={() => router.push("/details" as never)} /></Card>)}
-    {emergencies.map((emergency) => <Card key={emergency._id}><Text style={{ fontWeight: "800", color: colors.red }}>🚨 {emergency.level || "EMERGENCY"} • {emergency.status}</Text><Text style={styles.subtitle}>{emergency.emergencyId || emergency._id}</Text><Action label="View emergency details" onPress={() => router.push({ pathname: "/details", params: { id: emergency._id } } as never)} /></Card>)}
-    <Action label="Refresh" secondary onPress={load} />
-    <Action label="Back home" secondary onPress={() => router.replace("/home" as never)} />
-  </View>;
+
+  /* ─── Socket.IO real-time ──────────────────────────────── */
+  useSocket({
+    userId: user?._id,
+    onEvent: (event, data) => {
+      if (event === "family:emergency") {
+        setEmergencies((prev) => {
+          const item = data as Emergency;
+          if (prev.some((e) => e._id === item._id)) return prev;
+          return [item, ...prev];
+        });
+      }
+    },
+  });
+
+  useEffect(() => {
+    void Promise.resolve().then(load);
+    const timer = setInterval(() => void load(), 15_000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  const activeCount = emergencies.filter(
+    (e) => !["RESOLVED", "CANCELLED", "FALSE_ALARM"].includes(e.status || "")
+  ).length;
+
+  return (
+    <ScrollView style={styles.safe} contentContainerStyle={styles.scrollContent}>
+      <Header
+        title="Family dashboard"
+        subtitle="Live safety alerts from your connected network."
+      />
+
+      {activeCount > 0 && (
+        <StatusBanner
+          title={`🚨 ${activeCount} active emergency${activeCount > 1 ? "ies" : ""}`}
+          subtitle="Scroll down to see details and locations."
+        />
+      )}
+
+      {error ? (
+        <Card danger>
+          <Text style={styles.errorText}>{error}</Text>
+          <Action label="Retry" secondary onPress={load} />
+        </Card>
+      ) : null}
+
+      {loading && emergencies.length === 0 ? (
+        <EmptyState message="Loading alerts..." />
+      ) : emergencies.length === 0 ? (
+        <EmptyState message="No alerts right now. When a connected contact triggers SOS, it appears here instantly." />
+      ) : (
+        emergencies.map((emergency) => {
+          const isActive = !["RESOLVED", "CANCELLED", "FALSE_ALARM"].includes(emergency.status || "");
+          const mapUrl = getMapUrl(emergency);
+
+          return (
+            <Card key={emergency._id} danger={isActive}>
+              <View style={styles.spaceBetween}>
+                <View>
+                  <Text style={[styles.h3, { color: isActive ? colors.red : colors.ink }]}>
+                    {isActive ? "🚨 " : ""}
+                    {emergency.level || "EMERGENCY"}
+                  </Text>
+                  <Text style={styles.caption}>
+                    {emergency.emergencyId || emergency._id} • {elapsedSince(emergency.createdAt)}
+                  </Text>
+                </View>
+                <Badge
+                  label={emergency.status || "OPEN"}
+                  variant={statusVariant(emergency.status)}
+                />
+              </View>
+
+              <Divider />
+
+              {mapUrl && (
+                <Action
+                  label="📍 View live location on map"
+                  onPress={() => Linking.openURL(mapUrl)}
+                />
+              )}
+              <Action
+                label="View full details"
+                secondary
+                onPress={() =>
+                  router.push({ pathname: "/details", params: { id: emergency._id, status: emergency.status, level: emergency.level } } as never)
+                }
+              />
+            </Card>
+          );
+        })
+      )}
+
+      <Action label="🔄 Refresh" secondary onPress={load} />
+      <Action label="← Back home" secondary onPress={() => router.replace("/home" as never)} />
+      <View style={{ height: 30 }} />
+    </ScrollView>
+  );
 }

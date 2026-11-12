@@ -72,17 +72,33 @@ export async function api<T>(
   }
 }
 
+/** POST helper */
 export function post<T>(path: string, body: unknown, queueOffline = false) {
   return api<T>(path, { method: "POST", body: JSON.stringify(body) }, queueOffline);
 }
 
+/** PATCH helper */
+export function patch<T>(path: string, body: unknown) {
+  return api<T>(path, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+/** DELETE helper */
+export function del<T>(path: string) {
+  return api<T>(path, { method: "DELETE" });
+}
+
+/** Multipart audio upload */
 export async function uploadAudio<T>(path: string, uri: string) {
   if (!API_URL) return { offline: true, error: "Backend URL is not configured." } as ApiResult<T>;
   const token = await getToken();
   const form = new FormData();
   form.append("audio", { uri, name: `evidence-${Date.now()}.m4a`, type: "audio/m4a" } as unknown as Blob);
   try {
-    const response = await fetch(`${API_URL}${path}`, { method: "POST", headers: token ? { Authorization: "Bearer " + token } : {}, body: form });
+    const response = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: token ? { Authorization: "Bearer " + token } : {},
+      body: form,
+    });
     const payload = await response.json().catch(() => undefined);
     if (!response.ok) return { offline: false, status: response.status, error: payload?.error || `Request failed (${response.status})` };
     return { offline: false, status: response.status, data: payload as T };
@@ -91,6 +107,7 @@ export async function uploadAudio<T>(path: string, uri: string) {
   }
 }
 
+/** Retry queued offline requests */
 export async function flushQueue() {
   const raw = await AsyncStorage.getItem(QUEUE_KEY);
   const queue: QueuedRequest[] = raw ? (JSON.parse(raw) as QueuedRequest[]) : [];
@@ -105,8 +122,7 @@ export async function flushQueue() {
     if (result.offline) {
       remaining.push(request);
     } else if (result.status === 401 || result.status === 403) {
-      // Authentication failures cannot be fixed by retrying the same payload.
-      // Drop stale requests rather than showing an endless retry counter.
+      // Drop stale auth-failed requests
       continue;
     } else if (result.status && result.status >= 400) {
       remaining.push(request);

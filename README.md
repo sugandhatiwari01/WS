@@ -1,74 +1,50 @@
-# SafeHer Women Safety Emergency Ecosystem
+# SafeHer
 
-SafeHer is a full-stack emergency response reference application with an Expo Router mobile client and an Express/MongoDB backend. It supports three roles:
+SafeHer is a safety-planning and emergency-support app. Its practical differentiator is a **trip check-in**: choose a deadline, optionally prepare an ETA and one-time starting-location SMS for a trusted person, and prepare an arrival message when you check in. The message opens in the device's SMS app so the user can review and send it.
 
-- **USER**: starts and tracks emergencies.
-- **FAMILY**: a normal registered USER can be added as a trusted contact by their unique email and view that user's in-app emergency alerts.
-- **POLICE**: receives station-scoped incidents and atomically claims cases.
+The app also provides a safety-readiness check, SOS requests, location updates during an active SOS, trusted contacts, and family/police dashboards.
 
-## Repository layout
+## What it can and cannot do
+
+- The readiness card checks the app server, server-side contacts, location permission, and configured SMS/voice services. It cannot verify that a person or emergency service will respond.
+- SOS creates an incident in the configured SafeHer backend and may request contact notifications. Location updates are attempted while the app is open. **It does not call or dispatch emergency services. Call 112 directly for immediate danger.**
+- A trip message contains a one-time location pin, not live tracking. Timer expiration is handled only while the timer screen is running or when it is reopened; the app cannot send SOS while closed.
+- SMS, voice calls, location, and recording depend on device permissions, network access, and server/provider configuration. Provider acceptance does not guarantee delivery.
+
+Do not rely on this app as the only way to get help. Test on the target device and configure the backend integrations before real use.
+
+## Repository
 
 ```text
-safeher-backend/   Express, Mongoose, JWT/bcrypt, Socket.IO, REST API
-women-safety/      Expo React Native + TypeScript + Expo Router client
+safeher-backend/   Express, Supabase-backed API, JWT auth, Socket.IO
+women-safety/      Expo React Native + TypeScript + Expo Router app
 ```
 
-## Backend
+## Backend setup
+
+1. Create a Supabase project and run `safeher-backend/supabase/schema.sql`.
+2. Copy `safeher-backend/.env.example` to `.env` in `safeher-backend`.
+3. Configure `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and a strong `JWT_SECRET`. Keep the service-role key server-side.
+4. Optionally configure `FAST2SMS_API_KEY` and both `EDESY_API_KEY` and `EDESY_AGENT_ID` for SMS and incoming-call requests.
 
 ```powershell
-cd safeher-backend
-Copy-Item .env.example .env
-# Set MONGO_URI and JWT_SECRET in .env
+Set-Location safeher-backend
 npm install
-npm run seed
 npm test
 npm start
 ```
 
-From the repository root, the same commands are available as:
+## App setup
 
 ```powershell
-npm start          # Expo mobile app
-npm run web        # Expo web
-npm run backend    # Express backend
-npm run backend:test
-```
-
-The backend exposes `/health`, the requested `/api/auth`, `/api/family`, `/api/emergencies`, `/api/police`, and audio endpoints. Trusted contacts use `/api/contacts/search?email=...` and `/api/contacts`; only active registered `user` accounts can be added, and user email addresses are unique. Emergency alerts are delivered in-app to the linked user's account. `PoliceStation.location` has a `2dsphere` index; emergency creation uses `$near` to dispatch to the nearest active station. Police case claiming is a conditional `findOneAndUpdate` on `assignedOfficerId: null` and returns `CASE_ALREADY_CLAIMED` on a race.
-
-Socket.IO authenticates with the JWT handshake token and supports `station:{stationId}`, `emergency:{id}`, `user:{id}`, and `family:{id}` rooms. Incident timeline records are stored in `EmergencyEvent`; location and audio metadata use separate collections.
-
-Seed credentials (change these outside development):
-
-```text
-admin@safeher.local / ChangeMe123!
-officer@safeher.local / ChangeMe123!
-user.one@safeher.local / ChangeMe123!
-user.two@safeher.local / ChangeMe123!
-```
-
-To test trusted contacts, sign in as either demo USER, open **Settings → Trusted contacts**, search the other user's exact email, and add them. Then create an SOS from one account and sign in as the other account; the alert appears in the home/family dashboard. The seed command requires a reachable MongoDB connection.
-
-## Mobile
-
-```powershell
-cd women-safety
+Set-Location women-safety
 npm install
 $env:EXPO_PUBLIC_API_URL="http://YOUR-LAN-IP:3000"
-npx tsc --noEmit
+npm run typecheck
+npm run lint
 npx expo start
 ```
 
-For Expo web or a local simulator, `women-safety/.env.local` already points
-to `http://localhost:3000`. A physical phone cannot resolve the computer's
-localhost; replace it with the computer's LAN IP and ensure Windows Firewall
-allows TCP port 3000.
+The app's `.env.local` may set `EXPO_PUBLIC_API_URL` for local development. A physical phone cannot use the computer's `localhost`; use its LAN IP and allow the backend port through the firewall.
 
-The app includes role-aware auth entry points, a large SOS control, timer and shake trigger surfaces, active/history/family/police dashboards, location permission handling, and the API/offline boundary. Set `EXPO_PUBLIC_API_URL` to enable server calls; without it the client remains in an explicit local/offline mode rather than claiming that police were contacted.
-
-## Safety and platform limitations
-
-- Background location, microphone recording, accelerometer monitoring, and push notifications require native permissions and platform configuration. Expo Go cannot provide every background capability; use a development build for production testing.
-- This project does not claim emergency communication without internet. Offline state can preserve UI state and retry work, but dispatch requires a reachable backend.
-- Audio storage references are metadata only. Connect `EmergencyAudio.storageReference` to a private object store with signed URLs and enforce station/officer authorization before serving files.
-- Configure HTTPS, a real secret manager, restrictive CORS, production push credentials, audit retention, and operational monitoring before deployment.
+From the repository root, `npm start`, `npm run web`, `npm run backend`, and `npm run backend:test` are also available.

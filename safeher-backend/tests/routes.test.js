@@ -1,31 +1,37 @@
 const request = require("supertest");
 const { app } = require("../server");
 
-describe("configuration-gated integration routes", () => {
-  test("rejects calls when voice service is not configured", async () => {
-    const apiKey = process.env.EDESY_API_KEY;
-    const agentId = process.env.EDESY_AGENT_ID;
-    delete process.env.EDESY_API_KEY;
-    delete process.env.EDESY_AGENT_ID;
-
+/**
+ * Tests for the /api/notify routes.
+ *
+ * The old unauthenticated /make-call and /send-sms top-level routes have been
+ * moved to authenticated /api/notify/fake-call and /api/notify/sos-sms routes.
+ * These tests verify the new endpoints return appropriate errors when
+ * configuration or auth is missing.
+ */
+describe("notification routes", () => {
+  test("POST /api/notify/fake-call requires authentication", async () => {
     const response = await request(app)
-      .post("/make-call")
-      .send({ to: "+15551234567" });
+      .post("/api/notify/fake-call")
+      .send({ phone: "+15551234567" });
 
-    if (apiKey === undefined) delete process.env.EDESY_API_KEY;
-    else process.env.EDESY_API_KEY = apiKey;
-    if (agentId === undefined) delete process.env.EDESY_AGENT_ID;
-    else process.env.EDESY_AGENT_ID = agentId;
-    expect(response.status).toBe(503);
-    expect(response.body.error).toMatch(/not configured/i);
+    // 503 when DB not configured; 401 when DB is configured but no token
+    expect([401, 503]).toContain(response.status);
   });
 
-  test("validates SMS input before checking configuration", async () => {
+  test("POST /api/notify/sos-sms requires authentication", async () => {
     const response = await request(app)
-      .post("/send-sms")
-      .send({ phone: "", message: "" });
+      .post("/api/notify/sos-sms")
+      .send({ emergencyId: "EMG-TEST", userName: "Test User" });
 
-    expect(response.status).toBe(400);
-    expect(response.body.error).toMatch(/required/i);
+    expect([401, 503]).toContain(response.status);
+  });
+
+  test("POST /api/notify/sos-cancel requires authentication", async () => {
+    const response = await request(app)
+      .post("/api/notify/sos-cancel")
+      .send({ emergencyId: "EMG-TEST", userName: "Test User" });
+
+    expect([401, 503]).toContain(response.status);
   });
 });

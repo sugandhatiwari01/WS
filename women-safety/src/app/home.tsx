@@ -1,121 +1,396 @@
 import { Redirect, router } from "expo-router";
+import { RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync, useAudioRecorder, useAudioRecorderState } from "expo-audio";
 import * as Location from "expo-location";
-import { Accelerometer } from "expo-sensors";
-import { Audio } from "expo-av";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, Linking, Platform, ScrollView, Text, View, Vibration } from "react-native";
-import { Action, Card, Header } from "@/components/ui";
+import { useCallback, useEffect, useState } from "react";
+import { Alert, Linking, Platform, ScrollView, Text, View } from "react-native";
+import { Action, Badge, Card, Divider, Header, SosButton, StatusBanner } from "@/components/ui";
 import { useAuth } from "@/lib/auth";
 import { api, post, uploadAudio } from "@/lib/api";
-import { createAlert, resolveAlert } from "@/lib/storage";
+import { useSos } from "@/hooks/useSos";
+import { useSocket } from "@/hooks/useSocket";
 import { colors, styles } from "@/lib/theme";
 
-type IncomingEmergency = { _id: string; emergencyId?: string; level?: string; status?: string; nearbyStation?: { name?: string; distanceKm?: number; location?: { coordinates?: number[] } } };
+type IncomingEmergency = {
+  _id: string;
+  emergencyId?: string;
+  level?: string;
+  status?: string;
+  userName?: string;
+};
+
+type SafetyHealth = { ok?: boolean; sms?: boolean; voice?: boolean };
 
 export default function Home() {
-  const { user, signOut } = useAuth(); const [location, setLocation] = useState<string>("Location not shared"); const [active, setActive] = useState(false); const [emergencyId, setEmergencyId] = useState<string | null>(null); const [station, setStation] = useState<IncomingEmergency["nearbyStation"]>(); const [recording, setRecording] = useState<Audio.Recording | null>(null); const [incoming, setIncoming] = useState<IncomingEmergency[]>([]); const last = useRef(0); const seenIncoming = useRef("");
-  const loadIncoming = useCallback(async () => {
-    const result = await api<IncomingEmergency[]>("/api/family/emergencies");
-    if (result.data) {
-      const latest = result.data[0]?._id || "";
-      if (latest && seenIncoming.current && latest !== seenIncoming.current) Vibration.vibrate([0, 500, 250, 500]);
-      seenIncoming.current = latest;
-      setIncoming(result.data);
-    }
+  const { user, signOut } = useAuth();
+  const {
+    sosState,
+    countdown,
+    emergencyId,
+    nearbyStation,
+    locationStr,
+    elapsedLabel,
+    shakeEnabled,
+    startCountdown,
+    cancelCountdown,
+    cancelSos,
+  } = useSos();
+
+  const [incomingAlerts, setIncomingAlerts] = useState<IncomingEmergency[]>([]);
+  const [fakeCalling, setFakeCalling] = useState(false);
+  const [readiness, setReadiness] = useState({
+    loading: true,
+    backend: null as boolean | null,
+    contacts: null as number | null,
+    location: null as boolean | null,
+    sms: null as boolean | null,
+    voice: null as boolean | null,
+  });
+
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const recorderState = useAudioRecorderState(recorder);
+
+  const checkReadiness = useCallback(async () => {
+    setReadiness((current) => ({ ...current, loading: true }));
+    const [healthResult, contactsResult, locationResult] = await Promise.allSettled([
+      api<SafetyHealth>("/health"),
+      api<{ _id: string }[]>("/api/contacts"),
+      Location.getForegroundPermissionsAsync(),
+    ]);
+
+    const health = healthResult.status === "fulfilled" ? healthResult.value.data : undefined;
+    const contacts = contactsResult.status === "fulfilled" ? contactsResult.value.data : undefined;
+    const permission = locationResult.status === "fulfilled" ? locationResult.value : undefined;
+    setReadiness({
+      loading: false,
+      backend: Boolean(health?.ok && contacts !== undefined),
+      contacts: contacts?.length ?? null,
+      location: permission ? permission.status === "granted" : null,
+      sms: typeof health?.sms === "boolean" ? health.sms : null,
+      voice: typeof health?.voice === "boolean" ? health.voice : null,
+    });
   }, []);
-  const loadActiveEmergency = useCallback(async () => {
-    const result = await api<{ _id: string; emergencyId?: string; nearbyStation?: IncomingEmergency["nearbyStation"] }>("/api/emergencies/active");
-    if (result.data) {
-      setEmergencyId(result.data._id || result.data.emergencyId || null);
-      setStation(result.data.nearbyStation);
-      setActive(true);
-    }
-  }, []);
-  const triggerSos = useCallback(async (level: "LEVEL_1" | "LEVEL_2") => {
-    const localAlert = await createAlert("sos", location);
-    const [latitude, longitude] = location.split(",").map(Number);
-    const body = {
-      level,
-      triggerType: "SOS_BUTTON",
-      ...(Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : {}),
+
+  /* ─── Socket.IO real-time ──────────────────────────────── */
+  useSocket({
+    userId: user?._id,
+    onEvent: (event, data) => {
+      if (event === "family:emergency") {
+        setIncomingAlerts((prev) => {
+          const item = data as IncomingEmergency;
+          // Avoid duplicates
+          if (prev.some((a) => a._id === item._id || a.emergencyId === item.emergencyId)) return prev;
+          return [item, ...prev];
+        });
+      }
+    },
+  });
+
+  /* ─── Init ─────────────────────────────────────────────── */
+  useEffect(() => {
+    void Promise.resolve().then(checkReadiness);
+
+    // Load incoming family alerts via polling fallback (also updated via socket)
+    const loadIncoming = async () => {
+      const result = await api<IncomingEmergency[]>("/api/family/emergencies");
+      if (result.data) setIncomingAlerts(result.data);
     };
-    const result = await post<{ _id?: string; emergencyId?: string; nearbyStation?: IncomingEmergency["nearbyStation"] }>("/api/emergencies", body, true);
-    if (result.error && !result.offline) {
-      await resolveAlert(localAlert.id);
-      Alert.alert("SOS could not be sent", result.error);
-      return;
+    void loadIncoming();
+    const pollTimer = setInterval(() => void loadIncoming(), 15_000);
+
+    return () => {
+      clearInterval(pollTimer);
+    };
+  }, [checkReadiness]);
+
+  /* ─── SOS button press ─────────────────────────────────── */
+  const handleSosPress = () => {
+    if (sosState === "idle") {
+      startCountdown("LEVEL_1", "SOS_BUTTON");
+    } else if (sosState === "countdown") {
+      cancelCountdown();
+    } else if (sosState === "active") {
+      Alert.alert(
+        "Cancel SOS?",
+        "This will try to cancel the SOS in SafeHer and send an all-clear contact message if available.",
+        [
+          { text: "Keep SOS Active", style: "cancel" },
+          { text: "Cancel SOS", style: "destructive", onPress: () => void cancelSos() },
+        ]
+      );
     }
-    setEmergencyId(result.data?._id || result.data?.emergencyId || null);
-    setStation(result.data?.nearbyStation);
-    setActive(true);
-    Vibration.vibrate([0, 250, 150, 250]);
-    Alert.alert("SOS active", result.offline ? "Saved on this device and queued." : "Your safety network has been notified.");
-  }, [location]);
-  const cancelSos = useCallback(async () => {
-    if (!emergencyId) {
-      setActive(false);
-      return;
+  };
+
+  /* ─── Level 2 urgent ───────────────────────────────────── */
+  const handleLevel2 = () => {
+    if (sosState === "idle") startCountdown("LEVEL_2", "MANUAL_LEVEL_2");
+  };
+
+  const callEmergencyServices = async () => {
+    try {
+      await Linking.openURL("tel:112");
+    } catch {
+      Alert.alert("Unable to open the phone app", "Please open your phone app and call 112.");
     }
-    const result = await post(`/api/emergencies/${emergencyId}/cancel`, {}, true);
-    if (result.offline) {
-      Alert.alert("Cancellation queued", "The cancellation will sync when your connection returns.");
-      setActive(false);
-      return;
-    }
-    if (result.error) {
-      Alert.alert("Unable to cancel", result.error);
-      return;
-    }
-    setActive(false);
-    setEmergencyId(null);
-  }, [emergencyId]);
-  const toggleRecording = useCallback(async () => {
-    if (recording) {
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
+  };
+
+  /* ─── Audio recording ──────────────────────────────────── */
+  const toggleRecording = async () => {
+    if (recorderState.isRecording) {
+      await recorder.stop();
+      const uri = recorder.uri;
       if (uri && emergencyId) {
         const result = await uploadAudio(`/api/emergencies/${emergencyId}/audio`, uri);
-        Alert.alert(result.error ? "Audio upload failed" : "Audio saved", result.error || "The recording is attached to your active emergency.");
+        Alert.alert(
+          result.error ? "Audio upload failed" : "✅ Audio saved",
+          result.error || "Recording is attached to your active emergency."
+        );
       }
       return;
     }
-    const permission = await Audio.requestPermissionsAsync();
-    if (!permission.granted) return Alert.alert("Microphone permission needed", "Allow microphone access to record evidence.");
-    await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
-    const result = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-    setRecording(result.recording);
-  }, [emergencyId, recording]);
-  useEffect(() => {
-    Location.requestForegroundPermissionsAsync().then(async ({ status }) => {
-      if (status !== "granted") return;
-      try {
-        const p = await Location.getCurrentPositionAsync({});
-        setLocation(`${p.coords.latitude.toFixed(4)}, ${p.coords.longitude.toFixed(4)}`);
-      } catch {
-        setLocation("Location unavailable");
-      }
-    });
-    let sub: { remove: () => void } | undefined;
-    if (Platform.OS !== "web") {
-      sub = Accelerometer.addListener(({ x, y, z }) => {
-        const force = Math.sqrt(x * x + y * y + z * z);
-        if (force > 2.4 && Date.now() - last.current > 3000) {
-          last.current = Date.now();
-          Alert.alert("Shake detected", "Start an SOS alert?", [{ text: "Cancel" }, { text: "Start SOS", onPress: () => triggerSos("LEVEL_1") }]);
-        }
-      });
-      Accelerometer.setUpdateInterval(500);
+    const permission = await requestRecordingPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert("Microphone needed", "Allow microphone access to record evidence.");
+      return;
     }
-    void loadIncoming();
-    void loadActiveEmergency();
-    const incomingTimer = setInterval(() => { void loadIncoming(); }, 10000);
-    return () => { sub?.remove(); clearInterval(incomingTimer); };
-  }, [loadActiveEmergency, loadIncoming, triggerSos]);
+    await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+    await recorder.prepareToRecordAsync();
+    recorder.record();
+  };
+
+  /* ─── Fake call ────────────────────────────────────────── */
+  const triggerFakeCall = async () => {
+    setFakeCalling(true);
+    try {
+      const result = await post("/api/notify/fake-call", {});
+      if (result.error) {
+        Alert.alert("Call request failed", result.error);
+      } else {
+        Alert.alert("Call request accepted", "Check your profile phone. The voice provider may still fail to complete the call.");
+      }
+    } catch (error) {
+      Alert.alert("Call request failed", error instanceof Error ? error.message : "The request could not be completed.");
+    } finally {
+      setFakeCalling(false);
+    }
+  };
+
+  /* ─── Guards ───────────────────────────────────────────── */
   if (!user) return <Redirect href="/login" />;
-  const isUser = user.role === "user";
-  return <ScrollView style={styles.safe} contentContainerStyle={styles.container}><Header title={`Hi, ${user.name}`} subtitle={isUser ? "You are protected. Your trusted network is ready." : user.role === "family" ? "Stay connected to your family circle." : "Monitor and respond to active incidents."}/>
-    {incoming.length > 0 && <Card><Text style={{fontWeight:"800",color:colors.red}}>🚨 Trusted contact alerts</Text>{incoming.slice(0, 3).map((item) => <Text key={item._id} style={[styles.subtitle,{marginTop:8}]}>{item.emergencyId || item._id} • {item.level || "EMERGENCY"} • {item.status}</Text>)}<Action label="Open family dashboard" secondary onPress={()=>(router as any).push("/family")}/></Card>}
-    {isUser ? <><Card><Text style={{fontSize:20,fontWeight:"900",color:colors.ink}}>Emergency SOS</Text><Text style={styles.subtitle}>Choose the response level. Your location is shared with police and trusted contacts.</Text><Action label={active ? "SOS ACTIVE — CANCEL" : "SOS — LEVEL 1"} onPress={active ? cancelSos : () => triggerSos("LEVEL_1")}/>{!active && <Action label="SOS — LEVEL 2 (URGENT)" onPress={() => triggerSos("LEVEL_2")}/>}{active&&<><Text style={{color:colors.red,marginTop:12,fontWeight:"700"}}>Alert active • location {location}</Text><Action label={recording ? "STOP AND SAVE AUDIO" : "RECORD AUDIO EVIDENCE"} secondary onPress={toggleRecording}/></>}</Card><Card><Text style={{fontWeight:"800",fontSize:17}}>Current location</Text><Text style={[styles.subtitle,{marginTop:6}]}>{location}</Text>{station?.name && <><Text style={{fontWeight:"800",marginTop:14}}>Nearest police station</Text><Text style={styles.subtitle}>{station.name} • {station.distanceKm} km away (10 km response range)</Text><Action label="View station on map" secondary onPress={() => { const coordinates = station.location?.coordinates; if (coordinates) Linking.openURL(`https://maps.google.com/?q=${coordinates[1]},${coordinates[0]}`); }} /></>}<Action label="Trusted contacts & settings" secondary onPress={()=>(router as any).push("/settings")}/></Card><Card><Text style={{fontWeight:"800",fontSize:17}}>Safety tools</Text><Action label="Alert history" secondary onPress={()=>(router as any).push("/history")}/></Card></> : <Card><Text style={{fontSize:19,fontWeight:"800"}}>{user.role==="family"?"Family dashboard":"Police dashboard"}</Text><Text style={styles.subtitle}>Live response queue and nearby station coverage.</Text><Action label="Open dashboard" onPress={()=>(router as any).push(user.role==="family"?"/family":"/police")}/></Card>}
-    <Action label="Sign out" secondary onPress={()=>signOut()}/><View style={{height:30}}/><Text style={{textAlign:"center",color:colors.muted}}>If you are in immediate danger, call emergency services.</Text></ScrollView>;
+
+  /* ─── POLICE / FAMILY view ─────────────────────────────── */
+  if (user.role !== "user") {
+    return (
+      <ScrollView style={styles.safe} contentContainerStyle={styles.scrollContent}>
+        <Header
+          title={`Hi, ${user.name}`}
+          subtitle={user.role === "family" ? "Stay connected to your family circle." : "Monitor and respond to active incidents."}
+        />
+        <Card>
+          <Text style={styles.h2}>{user.role === "family" ? "Family dashboard" : "Police dashboard"}</Text>
+          <Text style={[styles.subtitle, { marginTop: 6 }]}>
+            {user.role === "family" ? "Live alerts from your connected network." : "Real-time incident response queue."}
+          </Text>
+          <Action
+            label={`Open ${user.role === "family" ? "family" : "police"} dashboard`}
+            onPress={() => router.push(user.role === "family" ? "/family" : ("/police" as never))}
+          />
+        </Card>
+        <Action label="Sign out" secondary onPress={signOut} />
+      </ScrollView>
+    );
+  }
+
+  /* ─── USER main view ───────────────────────────────────── */
+  return (
+    <ScrollView style={styles.safe} contentContainerStyle={styles.scrollContent}>
+      <Header
+        title={`Hi, ${user.name}`}
+        subtitle="Know what is ready before you need it."
+      />
+
+      <Card>
+        <View style={styles.spaceBetween}>
+          <Text style={styles.h2}>Safety readiness</Text>
+          <Badge
+            label={readiness.loading ? "CHECKING" : readiness.backend && (readiness.contacts ?? 0) > 0 && readiness.location ? "CORE READY" : "CHECK SETUP"}
+            variant={readiness.loading ? "neutral" : readiness.backend && (readiness.contacts ?? 0) > 0 && readiness.location ? "success" : "warning"}
+          />
+        </View>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          A quick check of your server connection, trusted contacts, and location permission. This cannot verify emergency-service response.
+        </Text>
+        <View style={{ marginTop: 12, gap: 8 }}>
+          <Text style={styles.caption}>
+            {readiness.backend === null ? "Server: checking…" : readiness.backend ? "Server and contact API: responding" : "Server or contact API: unavailable"}
+          </Text>
+          <Text style={styles.caption}>
+            {readiness.contacts === null ? "Trusted contacts: could not verify" : `Trusted contacts: ${readiness.contacts} on server`}
+          </Text>
+          <Text style={styles.caption}>
+            {readiness.location === null ? "Location permission: could not verify" : readiness.location ? "Location permission: allowed" : "Location permission: not allowed"}
+          </Text>
+          <Text style={styles.caption}>
+            {readiness.sms === null ? "SMS service: could not verify" : readiness.sms ? "SMS service: configured (delivery is not guaranteed)" : "SMS service: not configured"}
+          </Text>
+          <Text style={styles.caption}>
+            {readiness.voice === null ? "Incoming-call service: could not verify" : readiness.voice ? "Incoming-call service: configured" : "Incoming-call service: not configured"}
+          </Text>
+        </View>
+        {readiness.contacts === 0 && (
+          <Action label="Add a trusted contact" secondary onPress={() => router.push("/contacts" as never)} />
+        )}
+        {readiness.location === false && (
+          <Action
+            label="Allow location for SOS"
+            secondary
+            onPress={async () => {
+              const permission = await Location.requestForegroundPermissionsAsync();
+              if (!permission.granted) {
+                Alert.alert("Location is still off", "Without location permission, SafeHer cannot share your coordinates.");
+              }
+              await checkReadiness();
+            }}
+          />
+        )}
+        <Action
+          label={readiness.loading ? "Checking…" : "Run check again"}
+          secondary
+          disabled={readiness.loading}
+          onPress={() => void checkReadiness()}
+        />
+      </Card>
+
+      {/* Incoming family alerts */}
+      {incomingAlerts.length > 0 && (
+        <StatusBanner
+          title={`🚨 ${incomingAlerts.length} contact alert${incomingAlerts.length > 1 ? "s" : ""}`}
+          subtitle={`${incomingAlerts[0].level || "EMERGENCY"} from ${incomingAlerts[0].userName || "trusted contact"}`}
+          actionLabel="View"
+          onAction={() => router.push("/family" as never)}
+        />
+      )}
+
+      {/* Active SOS status banner */}
+      {sosState === "active" && (
+        <Card danger>
+          <Text style={[styles.h2, { color: colors.red }]}>🚨 SOS Active — {elapsedLabel}</Text>
+          <Text style={[styles.subtitle, { marginTop: 6 }]}>📍 {locationStr}</Text>
+          <Text style={[styles.caption, { marginTop: 6 }]}>
+            Location updates are attempted while SafeHer is open; this is not background tracking.
+          </Text>
+          {nearbyStation?.name && (
+            <Text style={[styles.caption, { marginTop: 4 }]}>
+              Nearest station: {nearbyStation.name} • {nearbyStation.distanceKm} km
+            </Text>
+          )}
+          <Divider />
+          <Action
+            label={recorderState.isRecording ? "⏹ Stop & save recording" : "🎙 Record audio evidence"}
+            secondary
+            onPress={toggleRecording}
+          />
+          {nearbyStation?.location?.coordinates && (
+            <Action
+              label="View station on map"
+              secondary
+              onPress={() => {
+                const [lng, lat] = nearbyStation.location!.coordinates!;
+                void Linking.openURL(`https://maps.google.com/?q=${lat},${lng}`);
+              }}
+            />
+          )}
+        </Card>
+      )}
+
+      {/* Emergency actions */}
+      <Card>
+        <Text style={styles.h2}>Need help right now?</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          {sosState === "idle"
+            ? "SOS asks SafeHer to share your location and alert linked contacts. It does not call emergency services."
+            : sosState === "countdown"
+            ? "SOS is about to start. Tap the circle or cancel below to stop it."
+            : sosState === "sending"
+            ? "SafeHer is contacting its server. This does not call emergency services."
+            : "Your SOS is active. Call 112 directly if you need emergency services."}
+        </Text>
+
+        <SosButton state={sosState} countdown={countdown} onPress={handleSosPress} />
+
+        {sosState === "idle" && (
+          <Action label="🔴 Level 2 — Urgent / Violence" danger onPress={handleLevel2} />
+        )}
+        {sosState === "countdown" && (
+          <Action label="✕ Cancel countdown" secondary onPress={cancelCountdown} />
+        )}
+
+        <Action
+          label="Call emergency services — 112"
+          danger
+          onPress={() => void callEmergencyServices()}
+        />
+
+        {Platform.OS !== "web" && shakeEnabled && sosState === "idle" && (
+          <Text style={[styles.caption, { textAlign: "center", marginTop: 8 }]}>
+            You can also shake your phone to start SOS.
+          </Text>
+        )}
+      </Card>
+
+      {/* Planned journey */}
+      <Card>
+        <Text style={styles.h2}>Going somewhere?</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          Set a check-in timer for a walk or journey. If it expires, SOS starts while the timer screen is active. If you close SafeHer, reopen that screen to check the deadline.
+        </Text>
+        <Action
+          label="Plan a safe trip"
+          secondary
+          disabled={sosState !== "idle"}
+          onPress={() => router.push("/timer" as never)}
+        />
+        <Action
+          label="Manage trusted contacts"
+          secondary
+          onPress={() => router.push("/contacts" as never)}
+        />
+      </Card>
+
+      {/* Additional tools */}
+      <Card>
+        <Text style={styles.h3}>More tools</Text>
+        <Action
+          label="Request an incoming call"
+          secondary
+          loading={fakeCalling}
+          disabled={readiness.voice !== true || !user.phone}
+          onPress={() => void triggerFakeCall()}
+        />
+        {(readiness.voice !== true || !user.phone) && (
+          <Text style={styles.caption}>
+            {readiness.voice !== true ? "The optional voice-call service is not configured on the server." : "Add a phone number to your profile to request a call."}
+          </Text>
+        )}
+        <Action
+          label="View alert history"
+          secondary
+          onPress={() => router.push("/history" as never)}
+        />
+      </Card>
+
+      {/* Current location */}
+      <Card>
+        <Text style={styles.h3}>Current location</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>{locationStr}</Text>
+      </Card>
+
+      <Action label="⚙️ Settings" secondary onPress={() => router.push("/settings" as never)} />
+      <Action label="Sign out" secondary onPress={signOut} />
+
+      <View style={{ height: 40 }} />
+      <Text style={[styles.caption, { textAlign: "center" }]}>
+        SafeHer is a support tool, not a replacement for emergency services. Call 112 for immediate danger.
+      </Text>
+    </ScrollView>
+  );
 }

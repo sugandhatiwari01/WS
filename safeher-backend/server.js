@@ -27,7 +27,7 @@ async function start() {
   } else {
     console.warn("Supabase is not configured; starting without database access.");
   }
-  server.listen(port, () => console.log(`SafeHer backend listening on ${port}`));
+  server.listen(port, "0.0.0.0", () => console.log(`SafeHer backend listening on ${port}`));
 }
 if (require.main === module) {
   start().catch((error) => { console.error("Unable to start server:", error); process.exit(1); });

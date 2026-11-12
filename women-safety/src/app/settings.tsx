@@ -1,2 +1,148 @@
-import { router } from "expo-router"; import { Alert, Linking, Text, View } from "react-native"; import { Action, Card, Header } from "@/components/ui"; import { styles } from "@/lib/theme";
-export default function Settings(){const open = async (url:string) => { try { const supported = await Linking.canOpenURL(url); if (!supported) throw new Error("This action is not supported on this device."); await Linking.openURL(url); } catch (error) { Alert.alert("Action unavailable", error instanceof Error ? error.message : "Please try again."); } }; return <View style={[styles.safe,styles.container]}><Header title="Safety settings" subtitle="Manage how your support network can reach you."/><Card><Text style={{fontWeight:"800"}}>Trusted contacts</Text><Text style={styles.subtitle}>Add and manage people who should receive your safety updates.</Text><Action label="Manage trusted contacts" onPress={()=>router.push("/contacts")}/><Action label="Call emergency services" secondary onPress={()=>open("tel:112")}/><Action label="Send an SMS" secondary onPress={()=>open("sms:")}/><Action label="Back home" secondary onPress={()=>router.replace("/home" as never)}/></Card></View>}
+/**
+ * Settings screen
+ *
+ * Sections:
+ *  - Profile (name, email, phone)
+ *  - SOS preferences (shake sensitivity)
+ *  - Trusted contacts
+ *  - Emergency quick-dial
+ *  - Fake call test
+ *  - Sign out
+ */
+
+import { router } from "expo-router";
+import { useState } from "react";
+import { Alert, Linking, ScrollView, Switch, Text, View } from "react-native";
+import { Action, Card, Divider, Header } from "@/components/ui";
+import { useAuth } from "@/lib/auth";
+import { useSos } from "@/hooks/useSos";
+import { post } from "@/lib/api";
+import { colors, styles } from "@/lib/theme";
+
+export default function Settings() {
+  const { user, signOut } = useAuth();
+  const { shakeEnabled, updateShakeEnabled } = useSos();
+  const [fakeCalling, setFakeCalling] = useState(false);
+
+  const openUrl = async (url: string) => {
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) throw new Error("Action not supported on this device.");
+      await Linking.openURL(url);
+    } catch (error) {
+      Alert.alert("Action unavailable", error instanceof Error ? error.message : "Please try again.");
+    }
+  };
+
+  const triggerFakeCall = async () => {
+    setFakeCalling(true);
+    try {
+      const result = await post("/api/notify/fake-call", {});
+      if (result.error) {
+        Alert.alert("Call request failed", result.error);
+      } else {
+        Alert.alert("Call request accepted", "Check your profile phone. The voice provider may still fail to complete the call.");
+      }
+    } catch (error) {
+      Alert.alert("Call request failed", error instanceof Error ? error.message : "The request could not be completed.");
+    } finally {
+      setFakeCalling(false);
+    }
+  };
+
+  const confirmSignOut = () => {
+    Alert.alert("Sign out", "Are you sure you want to sign out?", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Sign out", style: "destructive", onPress: () => void signOut() },
+    ]);
+  };
+
+  return (
+    <ScrollView style={styles.safe} contentContainerStyle={styles.scrollContent}>
+      <Header title="Settings" subtitle="Manage your profile and safety preferences." />
+
+      {/* Profile */}
+      <Card>
+        <Text style={styles.h3}>👤 My profile</Text>
+        <Divider />
+        <Text style={styles.caption}>Name</Text>
+        <Text style={[styles.h3, { marginTop: 2 }]}>{user?.name}</Text>
+        <Text style={[styles.caption, { marginTop: 10 }]}>Email</Text>
+        <Text style={[styles.subtitle, { marginTop: 2 }]}>{user?.email}</Text>
+        {user?.phone && (
+          <>
+            <Text style={[styles.caption, { marginTop: 10 }]}>Phone</Text>
+            <Text style={[styles.subtitle, { marginTop: 2 }]}>{user.phone}</Text>
+          </>
+        )}
+      </Card>
+
+      {/* SOS Preferences */}
+      <Card>
+        <Text style={styles.h3}>🛡️ SOS preferences</Text>
+        <Divider />
+        <View style={[styles.spaceBetween, { marginTop: 4 }]}>
+          <View style={{ flex: 1, paddingRight: 16 }}>
+            <Text style={styles.h3}>Shake-to-SOS</Text>
+            <Text style={styles.caption}>
+              Shake your phone hard to start the SOS countdown automatically. Your preference is saved on this device.
+            </Text>
+          </View>
+          <Switch
+            value={shakeEnabled}
+            onValueChange={(enabled) => void updateShakeEnabled(enabled)}
+            trackColor={{ false: colors.border, true: colors.primary }}
+            thumbColor={colors.white}
+          />
+        </View>
+      </Card>
+
+      {/* Trusted contacts */}
+      <Card>
+        <Text style={styles.h3}>👥 Trusted contacts</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          Add family and friends who may receive alerts. SMS requires server setup and delivery is not guaranteed.
+        </Text>
+        <Action label="Manage trusted contacts" onPress={() => router.push("/contacts" as never)} />
+      </Card>
+
+      {/* Emergency services */}
+      <Card>
+        <Text style={styles.h3}>📞 Emergency services</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>Quick-dial in an emergency.</Text>
+        <Divider />
+        <Action label="Call 112 — Emergency" danger onPress={() => openUrl("tel:112")} />
+        <Action label="Call 100 — Police" secondary onPress={() => openUrl("tel:100")} />
+        <Action label="Call 108 — Ambulance" secondary onPress={() => openUrl("tel:108")} />
+        <Action label="Call 1091 — Women helpline" secondary onPress={() => openUrl("tel:1091")} />
+      </Card>
+
+      {/* Fake call */}
+      <Card>
+        <Text style={styles.h3}>📱 Fake incoming call</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          Request an incoming call to the phone number on your profile. This requires the optional voice service and a saved phone number; delivery is not guaranteed.
+        </Text>
+        <Action
+          label={fakeCalling ? "Calling..." : "Test fake call"}
+          secondary
+          loading={fakeCalling}
+          disabled={!user?.phone}
+          onPress={triggerFakeCall}
+        />
+        {!user?.phone && <Text style={styles.caption}>Add a phone number to your profile to use this feature.</Text>}
+      </Card>
+
+      {/* More screens */}
+      <Card>
+        <Text style={styles.h3}>📋 More</Text>
+        <Action label="Alert history" secondary onPress={() => router.push("/history" as never)} />
+        <Action label="Gesture triggers" secondary onPress={() => router.push("/gesture" as never)} />
+      </Card>
+
+      <Action label="Sign out" danger onPress={confirmSignOut} />
+      <Action label="← Back" secondary onPress={() => router.back()} />
+      <View style={{ height: 40 }} />
+    </ScrollView>
+  );
+}
