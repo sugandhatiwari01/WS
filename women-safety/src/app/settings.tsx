@@ -17,12 +17,14 @@ import { Action, Card, Divider, Header } from "@/components/ui";
 import { useAuth } from "@/lib/auth";
 import { useSos } from "@/hooks/useSos";
 import { post } from "@/lib/api";
+import FakeCallModal from "@/components/fake-call-modal";
 import { colors, styles } from "@/lib/theme";
 
 export default function Settings() {
   const { user, signOut } = useAuth();
   const { shakeEnabled, updateShakeEnabled } = useSos();
   const [fakeCalling, setFakeCalling] = useState(false);
+  const [fakeCallModalVisible, setFakeCallModalVisible] = useState(false);
 
   const openUrl = async (url: string) => {
     try {
@@ -37,14 +39,17 @@ export default function Settings() {
   const triggerFakeCall = async () => {
     setFakeCalling(true);
     try {
-      const result = await post("/api/notify/fake-call", {});
-      if (result.error) {
-        Alert.alert("Call request failed", result.error);
-      } else {
-        Alert.alert("Call request accepted", "Check your profile phone. The voice provider may still fail to complete the call.");
-      }
-    } catch (error) {
-      Alert.alert("Call request failed", error instanceof Error ? error.message : "The request could not be completed.");
+      void post("/api/notify/fake-call", {});
+      Alert.alert(
+        "Incoming Call Scheduled",
+        "Your phone will ring in 3 seconds. Use this call to step away safely.",
+        [{ text: "OK" }]
+      );
+      setTimeout(() => {
+        setFakeCallModalVisible(true);
+      }, 3000);
+    } catch (_) {
+      setFakeCallModalVisible(true);
     } finally {
       setFakeCalling(false);
     }
@@ -121,16 +126,14 @@ export default function Settings() {
       <Card>
         <Text style={styles.h3}>📱 Fake incoming call</Text>
         <Text style={[styles.subtitle, { marginTop: 6 }]}>
-          Request an incoming call to the phone number on your profile. This requires the optional voice service and a saved phone number; delivery is not guaranteed.
+          Simulate an incoming phone call to give you a natural excuse to exit uncomfortable or threatening situations.
         </Text>
         <Action
-          label={fakeCalling ? "Calling..." : "Test fake call"}
+          label={fakeCalling ? "Scheduling call..." : "Test fake call"}
           secondary
           loading={fakeCalling}
-          disabled={!user?.phone}
           onPress={triggerFakeCall}
         />
-        {!user?.phone && <Text style={styles.caption}>Add a phone number to your profile to use this feature.</Text>}
       </Card>
 
       {/* More screens */}
@@ -143,6 +146,12 @@ export default function Settings() {
       <Action label="Sign out" danger onPress={confirmSignOut} />
       <Action label="← Back" secondary onPress={() => router.back()} />
       <View style={{ height: 40 }} />
+
+      <FakeCallModal
+        visible={fakeCallModalVisible}
+        callerName="Mom"
+        onDismiss={() => setFakeCallModalVisible(false)}
+      />
     </ScrollView>
   );
 }

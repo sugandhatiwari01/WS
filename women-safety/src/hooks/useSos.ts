@@ -13,7 +13,8 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Location from "expo-location";
 import { Accelerometer } from "expo-sensors";
 import { api, post } from "@/lib/api";
-import { createAlert, resolveAlert } from "@/lib/storage";
+import { createAlert, getContacts, resolveAlert } from "@/lib/storage";
+import { isInternetUnavailable, openSmsComposer } from "@/lib/safety-sms";
 import { useAuth } from "@/lib/auth";
 
 export type SosState = "idle" | "countdown" | "sending" | "active";
@@ -37,7 +38,7 @@ type EmergencyResponse = {
 };
 
 const COUNTDOWN_SECONDS = 3;
-const LOCATION_UPDATE_INTERVAL_MS = 30_000;
+const LOCATION_UPDATE_INTERVAL_MS = 5_000; // Live tracking interval (5s)
 const SHAKE_THRESHOLD = 2.5;
 const SHAKE_COOLDOWN_MS = 4_000;
 const SHAKE_ENABLED_KEY = "safeher-shake-sos-enabled";
@@ -70,6 +71,7 @@ function useSosController() {
 
   const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const locationTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const locationWatcherRef = useRef<Location.LocationSubscription | null>(null);
   const elapsedTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const pendingTriggerType = useRef<TriggerType>("SOS_BUTTON");
   const pendingLevel = useRef<SosLevel>("LEVEL_1");
@@ -116,6 +118,45 @@ function useSosController() {
     [getCurrentCoords]
   );
 
+  const startLiveLocationTracking = useCallback(async (id: string) => {
+    if (locationTimer.current) clearInterval(locationTimer.current);
+    if (locationWatcherRef.current) {
+      locationWatcherRef.current.remove();
+      locationWatcherRef.current = null;
+    }
+
+    try {
+      const permission = await Location.getForegroundPermissionsAsync();
+      if (permission.granted) {
+        const sub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 5 },
+          (pos) => {
+            const { latitude, longitude } = pos.coords;
+            setLocationStr(`${latitude.toFixed(5)}, ${longitude.toFixed(5)} · Live`);
+            void post(`/api/emergencies/${id}/location`, { latitude, longitude });
+          }
+        );
+        locationWatcherRef.current = sub;
+      }
+    } catch (_) {}
+
+    // Periodic fallback
+    locationTimer.current = setInterval(() => {
+      void updateLocationForEmergency(id);
+    }, LOCATION_UPDATE_INTERVAL_MS);
+  }, [updateLocationForEmergency]);
+
+  const stopLiveLocationTracking = useCallback(() => {
+    if (locationTimer.current) {
+      clearInterval(locationTimer.current);
+      locationTimer.current = null;
+    }
+    if (locationWatcherRef.current) {
+      locationWatcherRef.current.remove();
+      locationWatcherRef.current = null;
+    }
+  }, []);
+
   /* ─── countdown logic ──────────────────────────────────── */
 
   const startCountdown = useCallback((level: SosLevel, triggerType: TriggerType) => {
@@ -144,6 +185,37 @@ function useSosController() {
     setCountdown(COUNTDOWN_SECONDS);
   }, [sosState]);
 
+  const sendOfflineSmsFallback = useCallback(async (
+    coordinates: { latitude: number; longitude: number } | null,
+  ) => {
+    const contacts = await getContacts();
+    const phoneNumbers = [...new Set(contacts
+      .map((contact) => contact.phone?.trim())
+      .filter((phone): phone is string => Boolean(phone)))];
+    if (!phoneNumbers.length) {
+      return "No saved trusted-contact phone numbers are available for cellular SMS.";
+    }
+
+    const mapsLink = coordinates
+      ? `https://maps.google.com/?q=${coordinates.latitude},${coordinates.longitude}`
+      : "Location unavailable.";
+    const message = `SOS: ${userName || "Someone using SafeHer"} needs help. Location: ${mapsLink} Call 112 if immediate assistance is needed.`;
+    try {
+      const response = await openSmsComposer(phoneNumbers, message);
+      if (response.result === "sent") {
+        return "Your messaging app reported the SOS SMS sent or scheduled; delivery is not guaranteed.";
+      }
+      if (response.result === "unknown") {
+        return "The SMS composer was opened, but the device could not confirm sending. Check your messaging app.";
+      }
+      return "The SMS composer was cancelled, so the trusted contacts were not notified by SMS.";
+    } catch (error) {
+      return error instanceof Error
+        ? `Cellular SMS fallback failed: ${error.message}`
+        : "Cellular SMS fallback failed.";
+    }
+  }, [userName]);
+
   /* ─── fire SOS ─────────────────────────────────────────── */
 
   const fireSos = useCallback(async () => {
@@ -167,14 +239,32 @@ function useSosController() {
         body.longitude = coords.longitude;
       }
 
+      let internetUnavailable = false;
+      try {
+        internetUnavailable = await isInternetUnavailable();
+      } catch {
+        // Continue with the backend request; its result will determine whether SMS fallback is needed.
+      }
+      if (internetUnavailable) {
+        const smsStatus = await sendOfflineSmsFallback(coords);
+        await resolveAlert(localAlert.id);
+        setSosState("idle");
+        Alert.alert(
+          "No internet connection",
+          `${smsStatus} SafeHer could not create a server incident or notify the police dashboard. Call 112 directly for immediate help.`
+        );
+        return;
+      }
+
       const result = await post<EmergencyResponse>("/api/emergencies", body);
 
       if (result.error) {
+        const smsStatus = result.offline ? await sendOfflineSmsFallback(coords) : "";
         await resolveAlert(localAlert.id);
         Alert.alert(
-          result.offline ? "SOS was not sent" : "SOS could not be sent",
+          result.offline ? "SOS server unavailable" : "SOS could not be sent",
           result.offline
-            ? "SafeHer could not reach its server. Your location and contacts were not notified. Call 112 directly or try again when connected."
+            ? `${smsStatus} SafeHer could not create a server incident or notify the police dashboard. Call 112 directly or try again when connected.`
             : result.error
         );
         setSosState("idle");
@@ -232,9 +322,7 @@ function useSosController() {
         `${coords ? "Your location was shared with SafeHer." : "Location could not be shared."} ${contactAlertStatus} SafeHer does not dispatch emergency services. Call 112 directly for immediate help.`
       );
 
-      locationTimer.current = setInterval(() => {
-        void updateLocationForEmergency(id);
-      }, LOCATION_UPDATE_INTERVAL_MS);
+      void startLiveLocationTracking(id);
       elapsedTimer.current = setInterval(() => {
         setElapsedSeconds((s) => s + 1);
       }, 1000);
@@ -252,7 +340,7 @@ function useSosController() {
         `${error instanceof Error ? error.message : "An unexpected error occurred."} ${emergencyCreated ? "Contact notification status is unknown." : "Call 112 directly if you need immediate help."}`
       );
     }
-  }, [getCurrentCoords, updateLocationForEmergency, userName]);
+  }, [getCurrentCoords, sendOfflineSmsFallback, updateLocationForEmergency, userName]);
 
   /* ─── countdown effect ─────────────────────────────────── */
 
@@ -305,7 +393,7 @@ function useSosController() {
       return;
     }
 
-    if (locationTimer.current) { clearInterval(locationTimer.current); locationTimer.current = null; }
+    stopLiveLocationTracking();
     if (elapsedTimer.current) { clearInterval(elapsedTimer.current); elapsedTimer.current = null; }
     setSosState("idle");
     setEmergencyId(null);
@@ -349,12 +437,10 @@ function useSosController() {
         if (locationTimer.current) clearInterval(locationTimer.current);
         managedEmergencyId.current = id;
         elapsedTimer.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
-        locationTimer.current = setInterval(() => {
-          void updateLocationForEmergency(id);
-        }, LOCATION_UPDATE_INTERVAL_MS);
+        void startLiveLocationTracking(id);
       }
     }
-  }, [updateLocationForEmergency]);
+  }, [startLiveLocationTracking]);
 
   useEffect(() => {
     if (user?.role !== "user" || !user._id) return;
@@ -407,7 +493,7 @@ function useSosController() {
   useEffect(() => {
     return () => {
       if (countdownTimer.current) clearInterval(countdownTimer.current);
-      if (locationTimer.current) clearInterval(locationTimer.current);
+      stopLiveLocationTracking();
       if (elapsedTimer.current) clearInterval(elapsedTimer.current);
       managedEmergencyId.current = null;
     };

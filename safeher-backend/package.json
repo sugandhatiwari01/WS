@@ -6,6 +6,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "seed": "node seed.js",
+    "send-sms": "node scripts/send-emergency-sms.js",
     "test": "jest --runInBand"
   },
   "keywords": [],

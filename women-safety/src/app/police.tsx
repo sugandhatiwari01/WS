@@ -18,7 +18,6 @@ import { BadgeVariant, styles } from "@/lib/theme";
 type Incident = {
   _id: string;
   emergencyId?: string;
-  level?: string;
   status?: string;
   triggerType?: string;
   createdAt?: string;
@@ -43,12 +42,6 @@ function statusVariant(status?: string): BadgeVariant {
   if (status === "RESOLVED") return "success";
   if (["CANCELLED", "FALSE_ALARM"].includes(status)) return "neutral";
   return "neutral";
-}
-
-function levelVariant(level?: string): BadgeVariant {
-  if (level === "LEVEL_3") return "danger";
-  if (level === "LEVEL_2") return "warning";
-  return "info";
 }
 
 function elapsedSince(isoDate?: string): string {
@@ -105,6 +98,18 @@ export default function PoliceScreen() {
           knownIds.current.add(item._id);
           return [item, ...prev];
         });
+      } else if (event === "location:live") {
+        const loc = data as { emergencyId: string; latitude: number; longitude: number };
+        setIncidents((prev) =>
+          prev.map((item) =>
+            item._id === loc.emergencyId || item.emergencyId === loc.emergencyId
+              ? { ...item, currentLocation: { latitude: loc.latitude, longitude: loc.longitude } }
+              : item
+          )
+        );
+      } else if (event === "audio:evidence") {
+        Vibration.vibrate([0, 300, 100, 300]);
+        void load();
       } else if (event === "incident:claimed" || event === "emergency:cancelled") {
         void load();
       }
@@ -176,6 +181,9 @@ export default function PoliceScreen() {
           const action = STATUS_FLOW[incident.status || ""];
           const canClaim = ["CREATED", "DISPATCHED", "VIEWED"].includes(incident.status || "");
           const mapUrl = getMapUrl(incident);
+          const location = incident.currentLocation || incident.initialLocation;
+          const latitude = location?.latitude ?? location?.lat;
+          const longitude = location?.longitude ?? location?.lng;
 
           return (
             <Card key={incident._id} danger={canClaim}>
@@ -183,7 +191,6 @@ export default function PoliceScreen() {
               <View style={styles.spaceBetween}>
                 <View style={{ gap: 6 }}>
                   <View style={{ flexDirection: "row", gap: 8 }}>
-                    <Badge label={incident.level || "LEVEL_1"} variant={levelVariant(incident.level)} />
                     <Badge label={incident.status || "OPEN"} variant={statusVariant(incident.status)} />
                   </View>
                   <Text style={styles.caption}>
@@ -222,12 +229,17 @@ export default function PoliceScreen() {
 
               {/* Details */}
               <Action
-                label="View details & audio"
+                label="View incident & recordings"
                 secondary
                 onPress={() =>
                   router.push({
                     pathname: "/details",
-                    params: { id: incident._id, status: incident.status, level: incident.level },
+                    params: {
+                      id: incident._id,
+                      status: incident.status,
+                      latitude: latitude?.toString(),
+                      longitude: longitude?.toString(),
+                    },
                   } as never)
                 }
               />

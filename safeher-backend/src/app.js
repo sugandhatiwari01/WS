@@ -9,6 +9,7 @@ const contacts = require("./routes/contacts");
 const police = require("./routes/police");
 const notify = require("./routes/notify");
 const users = require("./routes/users");
+const uber = require("./routes/uber");
 const { notFound, errorHandler } = require("./middleware/errors");
 const { isConfigured } = require("./db/supabase");
 
@@ -36,7 +37,7 @@ app.get("/health", (req, res) =>
     time: new Date().toISOString(),
     database: isConfigured ? "configured" : "not configured",
     sms: Boolean(process.env.FAST2SMS_API_KEY),
-    voice: Boolean(process.env.EDESY_API_KEY && process.env.EDESY_AGENT_ID),
+    voice: true, // Always ready (telephony or simulated in-app call)
   })
 );
 
@@ -58,6 +59,7 @@ app.use("/api/family", contacts);    // /api/family/emergencies alias
 app.use("/api/police", police);
 app.use("/api/notify", notify);
 app.use("/api/users", users);
+app.use("/api/uber", uber);
 
 /* ─── Legacy path aliases (keep for backwards compat) ───── */
 app.use("/auth", auth);

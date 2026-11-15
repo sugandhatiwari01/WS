@@ -13,8 +13,9 @@ import * as SMS from "expo-sms";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Action, Card, Divider, Header } from "@/components/ui";
 import { useSos } from "@/hooks/useSos";
+import { useAuth } from "@/lib/auth";
 import { Contact, getContacts, saveContacts } from "@/lib/storage";
-import { api } from "@/lib/api";
+import { api, post } from "@/lib/api";
 import { colors, styles } from "@/lib/theme";
 
 const PRESET_MINUTES = [5, 10, 15, 30];
@@ -43,6 +44,7 @@ export default function TimerScreen() {
   const expiredRef = useRef(false);
 
   const { sosState, startCountdown } = useSos();
+  const { user } = useAuth();
 
   useEffect(() => {
     let active = true;
@@ -157,24 +159,17 @@ export default function TimerScreen() {
       Alert.alert("Choose a trusted contact", "Select someone with a saved phone number to prepare a trip message.");
       return;
     }
-    try {
-      if (!(await SMS.isAvailableAsync())) {
-        Alert.alert("SMS unavailable", "This device cannot open an SMS composer. You can still start a private check-in timer.");
-        return;
-      }
-    } catch (error) {
-      Alert.alert("SMS unavailable", error instanceof Error ? error.message : "The SMS composer could not be checked.");
-      return;
-    }
 
     const timer = await saveTimer(plannedMinutes, selectedContact, false);
     if (!timer) return;
 
+    let coords: { latitude: number; longitude: number } | null = null;
     let locationText = "Starting location unavailable.";
     try {
       const permission = await Location.requestForegroundPermissionsAsync();
       if (permission.granted) {
         const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        coords = { latitude: position.coords.latitude, longitude: position.coords.longitude };
         locationText = `Starting location: https://maps.google.com/?q=${position.coords.latitude},${position.coords.longitude}`;
       }
     } catch {
@@ -182,22 +177,39 @@ export default function TimerScreen() {
     }
 
     const arrivalTime = new Date(timer.expiresAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    const message = `I'm heading out now and plan to check in by ${arrivalTime}. ${locationText} This is not live location tracking. Please call me if I do not check in.`;
+
+    // AUTOMATED: Try server-side SMS first (zero user intervention)
     try {
-      const response = await SMS.sendSMSAsync(selectedContact.phone, message);
-      if (response.result === "sent") {
+      const serverResult = await post<{ ok: boolean; smsConfigured: boolean }>("/api/notify/trip-sms", {
+        contactPhone: selectedContact.phone,
+        contactName: selectedContact.name,
+        userName: user?.name,
+        arrivalTime,
+        latitude: coords?.latitude,
+        longitude: coords?.longitude,
+      });
+
+      if (serverResult.data?.ok) {
         if (await armPreparedTimer(timer)) {
-          Alert.alert("Trip check-in started", "Your messaging app reported the message sent; delivery is not guaranteed. Keep SafeHer open or reopen this screen before the deadline.");
+          Alert.alert(
+            "Trip check-in started (Automated)",
+            `An automated SMS was sent to ${selectedContact.name} with your starting location and ${arrivalTime} deadline.`
+          );
+          return;
         }
-      } else if (response.result === "unknown") {
-        Alert.alert(
-          "Confirm your trip message",
-          "Your device cannot confirm whether the message was sent. Check the messaging app, then start the timer only if you sent it.",
-          [
-            { text: "Cancel timer", style: "cancel", onPress: () => void discardPreparedTimer() },
-            { text: "I sent it — start timer", onPress: () => void armPreparedTimer(timer) },
-          ]
-        );
+      }
+    } catch (_) {}
+
+    // Offline / fallback to phone SMS app if server send didn't succeed
+    try {
+      if (!(await SMS.isAvailableAsync())) {
+        Alert.alert("SMS unavailable", "This device cannot open an SMS composer. You can still start a private check-in timer.");
+        return;
+      }
+      const message = `I'm heading out now and plan to check in by ${arrivalTime}. ${locationText} This is not live location tracking. Please call me if I do not check in.`;
+      const response = await SMS.sendSMSAsync(selectedContact.phone, message);
+      if (response.result === "sent" || response.result === "unknown") {
+        await armPreparedTimer(timer);
       } else {
         await discardPreparedTimer();
         Alert.alert("Message cancelled", "The trip timer was not started.");
@@ -206,25 +218,34 @@ export default function TimerScreen() {
       await discardPreparedTimer();
       Alert.alert("Trip message failed", error instanceof Error ? error.message : "The messaging app could not prepare the message.");
     }
-  }, [armPreparedTimer, discardPreparedTimer, plannedMinutes, saveTimer, selectedContact]);
+  }, [armPreparedTimer, discardPreparedTimer, plannedMinutes, saveTimer, selectedContact, user?.name]);
 
   const sendArrivalCheckin = useCallback(async (contact: CheckinContact) => {
+    // AUTOMATED: Try server-side SMS first
     try {
-      if (!(await SMS.isAvailableAsync())) {
-        Alert.alert("Timer stopped", "The SMS composer is unavailable. Contact your trusted person directly to confirm you arrived.");
+      const res = await post<{ ok: boolean }>("/api/notify/trip-arrival", {
+        contactPhone: contact.phone,
+        userName: user?.name,
+      });
+      if (res.data?.ok) {
+        Alert.alert(
+          "Timer stopped (Automated)",
+          `An automated arrival SMS was sent to ${contact.name}. You're all set!`
+        );
         return;
       }
-      const response = await SMS.sendSMSAsync(contact.phone, "I arrived safely. My check-in timer is stopped.");
-      Alert.alert(
-        "Timer stopped",
-        response.result === "sent"
-          ? "Your messaging app reported the arrival message sent; delivery is not guaranteed."
-          : "The arrival message may not have been sent. Please verify it in your messaging app."
-      );
+    } catch (_) {}
+
+    // Fallback to native SMS composer
+    try {
+      if (await SMS.isAvailableAsync()) {
+        await SMS.sendSMSAsync(contact.phone, `I arrived safely. My SafeHer check-in timer is stopped.`);
+      }
+      Alert.alert("Check-in complete", "Your timer has been stopped.");
     } catch (error) {
-      Alert.alert("Timer stopped", error instanceof Error ? `Could not prepare the arrival message: ${error.message}` : "Could not prepare the arrival message. Contact your trusted person directly.");
+      Alert.alert("Timer stopped", error instanceof Error ? `Could not prepare the arrival message: ${error.message}` : "Contact your trusted person directly.");
     }
-  }, []);
+  }, [user?.name]);
 
   const stopTimer = useCallback(async () => {
     try {

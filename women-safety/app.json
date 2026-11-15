@@ -34,7 +34,14 @@
           "imageWidth": 76
         }
       ],
-      "expo-audio",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "SafeHer uses the microphone only when you start recording during an SOS.",
+          "recordAudioAndroid": true,
+          "enableBackgroundRecording": false
+        }
+      ],
       "expo-status-bar",
       "expo-web-browser",
       "expo-asset"

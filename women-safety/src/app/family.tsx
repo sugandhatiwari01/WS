@@ -17,7 +17,6 @@ import { colors, styles } from "@/lib/theme";
 type Emergency = {
   _id: string;
   emergencyId?: string;
-  level?: string;
   status?: string;
   createdAt?: string;
   currentLocation?: { latitude?: number; longitude?: number } | null;
@@ -76,6 +75,17 @@ export default function FamilyScreen() {
           if (prev.some((e) => e._id === item._id)) return prev;
           return [item, ...prev];
         });
+      } else if (event === "location:live") {
+        const loc = data as { emergencyId: string; latitude: number; longitude: number };
+        setEmergencies((prev) =>
+          prev.map((e) =>
+            e._id === loc.emergencyId || e.emergencyId === loc.emergencyId
+              ? { ...e, currentLocation: { latitude: loc.latitude, longitude: loc.longitude } }
+              : e
+          )
+        );
+      } else if (event === "audio:evidence" || event === "family:ride") {
+        void load();
       }
     },
   });
@@ -126,7 +136,7 @@ export default function FamilyScreen() {
                 <View>
                   <Text style={[styles.h3, { color: isActive ? colors.red : colors.ink }]}>
                     {isActive ? "🚨 " : ""}
-                    {emergency.level || "EMERGENCY"}
+                    SOS alert
                   </Text>
                   <Text style={styles.caption}>
                     {emergency.emergencyId || emergency._id} • {elapsedSince(emergency.createdAt)}
@@ -142,15 +152,23 @@ export default function FamilyScreen() {
 
               {mapUrl && (
                 <Action
-                  label="📍 View live location on map"
+                  label={`📍 LIVE MAP: ${emergency.currentLocation?.latitude ? `${emergency.currentLocation.latitude.toFixed(5)}, ${emergency.currentLocation.longitude?.toFixed(5)}` : "View on map"}`}
                   onPress={() => Linking.openURL(mapUrl)}
                 />
               )}
               <Action
-                label="View full details"
+                label="View details & audio evidence"
                 secondary
                 onPress={() =>
-                  router.push({ pathname: "/details", params: { id: emergency._id, status: emergency.status, level: emergency.level } } as never)
+                  router.push({
+                    pathname: "/details",
+                    params: {
+                      id: emergency._id,
+                      status: emergency.status,
+                      latitude: emergency.currentLocation?.latitude?.toString() || emergency.initialLocation?.latitude?.toString(),
+                      longitude: emergency.currentLocation?.longitude?.toString() || emergency.initialLocation?.longitude?.toString(),
+                    },
+                  } as never)
                 }
               />
             </Card>

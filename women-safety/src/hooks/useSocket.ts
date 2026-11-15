@@ -67,11 +67,14 @@ export function useSocket({
 
     const eventNames = [
       "family:emergency",
+      "family:ride",
       "emergency:new",
       "emergency:cancelled",
       "emergency:escalated",
       "incident:claimed",
       "location:update",
+      "location:live",
+      "audio:evidence",
       "connect",
       "disconnect",
     ];

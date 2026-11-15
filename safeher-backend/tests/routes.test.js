@@ -34,4 +34,17 @@ describe("notification routes", () => {
 
     expect([401, 503]).toContain(response.status);
   });
+
+  test("POST /api/notify/ride-sms requires authentication", async () => {
+    const response = await request(app)
+      .post("/api/notify/ride-sms")
+      .send({
+        service: "Uber",
+        driverName: "Test Driver",
+        vehicle: "Test vehicle",
+        plate: "TEST-123",
+      });
+
+    expect([401, 503]).toContain(response.status);
+  });
 });

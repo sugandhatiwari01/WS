@@ -1,24 +1,26 @@
 import { Redirect, router } from "expo-router";
 import { RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync, useAudioRecorder, useAudioRecorderState } from "expo-audio";
 import * as Location from "expo-location";
-import { useCallback, useEffect, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Linking, Platform, ScrollView, Text, View } from "react-native";
 import { Action, Badge, Card, Divider, Header, SosButton, StatusBanner } from "@/components/ui";
 import { useAuth } from "@/lib/auth";
 import { api, post, uploadAudio } from "@/lib/api";
 import { useSos } from "@/hooks/useSos";
 import { useSocket } from "@/hooks/useSocket";
+import FakeCallModal from "@/components/fake-call-modal";
 import { colors, styles } from "@/lib/theme";
 
 type IncomingEmergency = {
   _id: string;
   emergencyId?: string;
-  level?: string;
   status?: string;
   userName?: string;
 };
 
 type SafetyHealth = { ok?: boolean; sms?: boolean; voice?: boolean };
+type PendingAudio = { uri: string; emergencyId: string };
 
 export default function Home() {
   const { user, signOut } = useAuth();
@@ -37,6 +39,9 @@ export default function Home() {
 
   const [incomingAlerts, setIncomingAlerts] = useState<IncomingEmergency[]>([]);
   const [fakeCalling, setFakeCalling] = useState(false);
+  const [fakeCallModalVisible, setFakeCallModalVisible] = useState(false);
+  const [audioUploading, setAudioUploading] = useState(false);
+  const [pendingAudio, setPendingAudio] = useState<PendingAudio | null>(null);
   const [readiness, setReadiness] = useState({
     loading: true,
     backend: null as boolean | null,
@@ -48,6 +53,22 @@ export default function Home() {
 
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(recorder);
+  const pendingAudioKey = user?._id ? `safeher-pending-audio-${user._id}` : null;
+
+  useEffect(() => {
+    if (!pendingAudioKey || !emergencyId) return;
+    let active = true;
+    void AsyncStorage.getItem(pendingAudioKey).then((value) => {
+      if (!active || !value) return;
+      const saved = JSON.parse(value) as PendingAudio;
+      if (saved.uri && saved.emergencyId === emergencyId) setPendingAudio(saved);
+    }).catch((error) => {
+      if (active) {
+        Alert.alert("Saved audio unavailable", error instanceof Error ? error.message : "The pending audio upload could not be restored.");
+      }
+    });
+    return () => { active = false; };
+  }, [emergencyId, pendingAudioKey]);
 
   const checkReadiness = useCallback(async () => {
     setReadiness((current) => ({ ...current, loading: true }));
@@ -120,11 +141,6 @@ export default function Home() {
     }
   };
 
-  /* ─── Level 2 urgent ───────────────────────────────────── */
-  const handleLevel2 = () => {
-    if (sosState === "idle") startCountdown("LEVEL_2", "MANUAL_LEVEL_2");
-  };
-
   const callEmergencyServices = async () => {
     try {
       await Linking.openURL("tel:112");
@@ -133,42 +149,152 @@ export default function Home() {
     }
   };
 
-  /* ─── Audio recording ──────────────────────────────────── */
-  const toggleRecording = async () => {
-    if (recorderState.isRecording) {
-      await recorder.stop();
-      const uri = recorder.uri;
-      if (uri && emergencyId) {
-        const result = await uploadAudio(`/api/emergencies/${emergencyId}/audio`, uri);
-        Alert.alert(
-          result.error ? "Audio upload failed" : "✅ Audio saved",
-          result.error || "Recording is attached to your active emergency."
-        );
+  /* ─── Automated 10-second audio recording when SOS triggers ─── */
+  const autoRecordedEmergencyId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (sosState !== "active" || !emergencyId) {
+      if (sosState === "idle") autoRecordedEmergencyId.current = null;
+      return;
+    }
+    if (autoRecordedEmergencyId.current === emergencyId) return;
+    autoRecordedEmergencyId.current = emergencyId;
+
+    let cancelled = false;
+    const startAutoRecord = async () => {
+      try {
+        const permission = await requestRecordingPermissionsAsync();
+        if (!permission.granted || cancelled) return;
+        await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+        await recorder.prepareToRecordAsync();
+        recorder.record();
+
+        setTimeout(async () => {
+          if (cancelled) return;
+          try {
+            await recorder.stop();
+            await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+            const uri = recorder.uri || recorderState.url;
+            if (uri && !cancelled) {
+              await uploadRecording(uri);
+            }
+          } catch (e) {
+            console.warn("Auto recording finish error:", e);
+          }
+        }, 10_000);
+      } catch (e) {
+        console.warn("Auto recording start error:", e);
       }
+    };
+
+    const timer = setTimeout(() => {
+      void startAutoRecord();
+    }, 600);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [sosState, emergencyId]);
+
+  /* ─── Audio recording ──────────────────────────────────── */
+  const uploadRecording = async (uri: string) => {
+    if (!emergencyId) {
+      Alert.alert("Recording not uploaded", "There is no active server incident to attach this recording to. Start an SOS before recording.");
       return;
     }
-    const permission = await requestRecordingPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert("Microphone needed", "Allow microphone access to record evidence.");
-      return;
+    const pending = { uri, emergencyId };
+    setPendingAudio(pending);
+    if (pendingAudioKey) {
+      try {
+        await AsyncStorage.setItem(pendingAudioKey, JSON.stringify(pending));
+      } catch (error) {
+        Alert.alert("Retry not saved", error instanceof Error ? error.message : "The pending upload could not be saved on this device.");
+      }
     }
-    await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-    await recorder.prepareToRecordAsync();
-    recorder.record();
+    setAudioUploading(true);
+    try {
+      const result = await uploadAudio<{ url?: string }>(`/api/emergencies/${emergencyId}/audio`, uri);
+      if (result.error) {
+        Alert.alert(
+          "Audio upload failed",
+          `The recording is saved on this device but is not available in the police dashboard yet. ${result.error}`
+        );
+        return;
+      }
+      setPendingAudio(null);
+      let cleanupWarning = "";
+      if (pendingAudioKey) {
+        try {
+          await AsyncStorage.removeItem(pendingAudioKey);
+        } catch (error) {
+          cleanupWarning = error instanceof Error
+            ? ` Its local retry marker could not be removed: ${error.message}`
+            : " Its local retry marker could not be removed.";
+        }
+      }
+      Alert.alert(
+        "Audio shared with dispatch",
+        `The recording is attached to this incident and can be reviewed from the police dashboard.${cleanupWarning}`
+      );
+      // Automatically send audio alert SMS & socket broadcast to family and police
+      void post("/api/notify/audio-alert", {
+        emergencyId,
+        userName: user?.name,
+        audioUrl: result.data?.url,
+      });
+    } catch (error) {
+      Alert.alert("Audio upload failed", error instanceof Error ? error.message : "The recording is still saved on this device.");
+    } finally {
+      setAudioUploading(false);
+    }
+  };
+
+  const toggleRecording = async () => {
+    try {
+      if (recorderState.isRecording) {
+        await recorder.stop();
+        await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+        const uri = recorder.uri || recorderState.url;
+        if (!uri) {
+          Alert.alert("Recording unavailable", "The microphone did not produce an audio file.");
+          return;
+        }
+        await uploadRecording(uri);
+        return;
+      }
+      if (sosState !== "active" || !emergencyId) {
+        Alert.alert("Start SOS first", "Audio evidence can be recorded only while a server incident is active.");
+        return;
+      }
+      const permission = await requestRecordingPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Microphone needed", "Allow microphone access to record audio during an active SOS.");
+        return;
+      }
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await recorder.prepareToRecordAsync();
+      recorder.record();
+    } catch (error) {
+      Alert.alert("Audio recording failed", error instanceof Error ? error.message : "The microphone could not be started.");
+    }
   };
 
   /* ─── Fake call ────────────────────────────────────────── */
   const triggerFakeCall = async () => {
     setFakeCalling(true);
     try {
-      const result = await post("/api/notify/fake-call", {});
-      if (result.error) {
-        Alert.alert("Call request failed", result.error);
-      } else {
-        Alert.alert("Call request accepted", "Check your profile phone. The voice provider may still fail to complete the call.");
-      }
-    } catch (error) {
-      Alert.alert("Call request failed", error instanceof Error ? error.message : "The request could not be completed.");
+      void post("/api/notify/fake-call", {});
+      Alert.alert(
+        "Incoming Call Scheduled",
+        "Your phone will ring with an incoming call in 3 seconds. Use it to excuse yourself safely.",
+        [{ text: "OK" }]
+      );
+      setTimeout(() => {
+        setFakeCallModalVisible(true);
+      }, 3000);
+    } catch (_) {
+      setFakeCallModalVisible(true);
     } finally {
       setFakeCalling(false);
     }
@@ -264,7 +390,7 @@ export default function Home() {
       {incomingAlerts.length > 0 && (
         <StatusBanner
           title={`🚨 ${incomingAlerts.length} contact alert${incomingAlerts.length > 1 ? "s" : ""}`}
-          subtitle={`${incomingAlerts[0].level || "EMERGENCY"} from ${incomingAlerts[0].userName || "trusted contact"}`}
+          subtitle={`${incomingAlerts[0].userName || "A trusted contact"} needs help`}
           actionLabel="View"
           onAction={() => router.push("/family" as never)}
         />
@@ -284,11 +410,35 @@ export default function Home() {
             </Text>
           )}
           <Divider />
+          <Text style={[styles.caption, { marginTop: 6 }]}>
+            Audio is recorded only when you start it. The microphone indicator stays visible while recording.
+          </Text>
+          {recorderState.isRecording ? (
+            <Text accessibilityLiveRegion="polite" style={[styles.h3, { color: colors.red, marginTop: 8 }]}>
+              ● Recording surroundings · {Math.floor(recorderState.durationMillis / 1000)}s
+            </Text>
+          ) : null}
           <Action
-            label={recorderState.isRecording ? "⏹ Stop & save recording" : "🎙 Record audio evidence"}
+            label={audioUploading ? "Uploading audio…" : recorderState.isRecording ? "⏹ Stop & upload recording" : "🎙 Record surroundings"}
             secondary
-            onPress={toggleRecording}
+            loading={audioUploading}
+            disabled={audioUploading}
+            onPress={() => void toggleRecording()}
           />
+          {pendingAudio?.emergencyId === emergencyId ? (
+            <Action
+              label="Retry upload saved recording"
+              secondary
+              loading={audioUploading}
+              disabled={audioUploading}
+              onPress={() => void uploadRecording(pendingAudio.uri)}
+            />
+          ) : null}
+          {pendingAudio?.emergencyId === emergencyId ? (
+            <Text style={styles.caption}>
+              This recording is on this device only until its upload succeeds. Police cannot review it yet.
+            </Text>
+          ) : null}
           {nearbyStation?.location?.coordinates && (
             <Action
               label="View station on map"
@@ -317,9 +467,6 @@ export default function Home() {
 
         <SosButton state={sosState} countdown={countdown} onPress={handleSosPress} />
 
-        {sosState === "idle" && (
-          <Action label="🔴 Level 2 — Urgent / Violence" danger onPress={handleLevel2} />
-        )}
         {sosState === "countdown" && (
           <Action label="✕ Cancel countdown" secondary onPress={cancelCountdown} />
         )}
@@ -356,21 +503,30 @@ export default function Home() {
         />
       </Card>
 
+      <Card>
+        <Text style={styles.h2}>Taking a cab?</Text>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          Share your driver name, vehicle plate, trip reference, destination, and current map pin with trusted contacts.
+        </Text>
+        <Action
+          label="Share cab details"
+          secondary
+          onPress={() => router.push("/ride" as never)}
+        />
+      </Card>
+
       {/* Additional tools */}
       <Card>
-        <Text style={styles.h3}>More tools</Text>
+        <Text style={styles.h3}>Escape call tool</Text>
+        <Text style={[styles.subtitle, { marginTop: 4, marginBottom: 8 }]}>
+          Simulate an incoming phone call to give you a natural excuse to exit uncomfortable or threatening situations.
+        </Text>
         <Action
-          label="Request an incoming call"
+          label={fakeCalling ? "Scheduling call…" : "📞 Request an incoming call"}
           secondary
           loading={fakeCalling}
-          disabled={readiness.voice !== true || !user.phone}
           onPress={() => void triggerFakeCall()}
         />
-        {(readiness.voice !== true || !user.phone) && (
-          <Text style={styles.caption}>
-            {readiness.voice !== true ? "The optional voice-call service is not configured on the server." : "Add a phone number to your profile to request a call."}
-          </Text>
-        )}
         <Action
           label="View alert history"
           secondary
@@ -391,6 +547,12 @@ export default function Home() {
       <Text style={[styles.caption, { textAlign: "center" }]}>
         SafeHer is a support tool, not a replacement for emergency services. Call 112 for immediate danger.
       </Text>
+
+      <FakeCallModal
+        visible={fakeCallModalVisible}
+        callerName="Mom"
+        onDismiss={() => setFakeCallModalVisible(false)}
+      />
     </ScrollView>
   );
 }

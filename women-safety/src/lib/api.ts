@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Platform } from "react-native";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL || "").replace(/\/$/, "");
 const TOKEN_KEY = "women-safety-token";
@@ -88,11 +89,37 @@ export function del<T>(path: string) {
 }
 
 /** Multipart audio upload */
-export async function uploadAudio<T>(path: string, uri: string) {
-  if (!API_URL) return { offline: true, error: "Backend URL is not configured." } as ApiResult<T>;
+export async function uploadAudio<T>(path: string, uri: string): Promise<ApiResult<T>> {
+  if (!API_URL) return { offline: true, error: "Backend URL is not configured." };
   const token = await getToken();
   const form = new FormData();
-  form.append("audio", { uri, name: `evidence-${Date.now()}.m4a`, type: "audio/m4a" } as unknown as Blob);
+  const filename = `evidence-${Date.now()}.m4a`;
+
+  try {
+    if (Platform.OS === "web" || uri.startsWith("blob:") || uri.startsWith("data:") || uri.startsWith("http")) {
+      // In Web / browser: fetch the blob and append actual Blob/File object
+      const blobResponse = await fetch(uri);
+      const blob = await blobResponse.blob();
+      const ext = blob.type?.includes("webm") ? "webm" : blob.type?.includes("ogg") ? "ogg" : "m4a";
+      form.append("audio", blob, `evidence-${Date.now()}.${ext}`);
+    } else {
+      // In Native (Android / iOS): use React Native's file descriptor object
+      form.append("audio", {
+        uri,
+        name: filename,
+        type: "audio/m4a",
+      } as unknown as Blob);
+    }
+  } catch (err) {
+    console.warn("Audio file preparation error:", err);
+    // Fallback to RN file descriptor
+    form.append("audio", {
+      uri,
+      name: filename,
+      type: "audio/m4a",
+    } as unknown as Blob);
+  }
+
   try {
     const response = await fetch(`${API_URL}${path}`, {
       method: "POST",

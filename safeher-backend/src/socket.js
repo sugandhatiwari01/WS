@@ -12,6 +12,7 @@ function createSocketServer(httpServer) {
     if (socket.user.role === "family") socket.join(`family:${userId}`);
     if (socket.user.role === "police" || socket.user.role === "responder") socket.join("police");
     socket.on("emergency:join", id => socket.join(`emergency:${id}`));
+    socket.on("location:subscribe", id => socket.join(`emergency:${id}`));
     socket.on("emergency:leave", id => socket.leave(`emergency:${id}`));
   });
   return io;
