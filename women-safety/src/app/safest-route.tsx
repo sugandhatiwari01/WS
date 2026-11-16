@@ -1,22 +1,22 @@
 /**
- * India-Wide Safest Route Navigation Screen
+ * India-Wide Safest Route Navigation Screen — Universal Edition
  *
  * Capabilities:
- * - Detect current user GPS location across India
- * - Live place search autocomplete across all Indian cities & towns
- * - OSRM Multi-Route alternative corridors generation
- * - PostGIS spatial evaluation (Police, Streetlights, Hospitals, NCRB crime rates, Transit)
- * - Safe Route comparison cards (Safety Score, Distance, Travel time, Indicators)
- * - Visual Route Map with real-time multi-corridor projection
- * - Turn-by-turn Navigation Simulation Mode with distance remaining & safety alerts
- * - User Safety Concern Reporting (Poor lighting, Harassment hotspot, Deserted stretch)
+ * - Enter ANY starting location in India (editable text or 1-tap live GPS)
+ * - Enter ANY destination anywhere in India (by place name, city, landmark, or coordinates)
+ * - Live Pan-India Autocomplete powered by Photon OpenStreetMap & India Directory
+ * - Automatically resolves and geocodes any typed text on the fly
+ * - Multi-corridor OSRM alternative route generation across all Indian States & UTs
+ * - Comprehensive safety evaluation (Illumination, Police Posts, NCRB Risk Index, Transit Hubs)
+ * - Interactive multi-route visual map with infrastructure pins
+ * - Real-time turn-by-turn navigation simulation mode
+ * - Community safety concern reporting
  */
 
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   Linking,
   ScrollView,
   StyleSheet,
@@ -30,7 +30,7 @@ import * as Location from "expo-location";
 import { Action, Badge, Card, Divider, Header } from "@/components/ui";
 import RouteMapView, { EvaluatedRoute } from "@/components/route-map-view";
 import { api, post } from "@/lib/api";
-import { BadgeVariant, colors, styles as themeStyles } from "@/lib/theme";
+import { colors, styles as themeStyles } from "@/lib/theme";
 
 type PlaceResult = {
   placeId: number | string;
@@ -57,7 +57,9 @@ export default function SafestRouteScreen() {
   const [destinationCoords, setDestinationCoords] = useState<{ latitude: number; longitude: number } | null>(null);
 
   // Search Results State
-  const [searchResults, setSearchResults] = useState<PlaceResult[]>([]);
+  const [activeSearchField, setActiveSearchField] = useState<"origin" | "dest" | null>(null);
+  const [originSuggestions, setOriginSuggestions] = useState<PlaceResult[]>([]);
+  const [destSuggestions, setDestSuggestions] = useState<PlaceResult[]>([]);
   const [searching, setSearching] = useState(false);
 
   // Route & Safety Evaluation State
@@ -72,7 +74,7 @@ export default function SafestRouteScreen() {
   const [remainingDistM, setRemainingDistM] = useState(0);
   const [remainingSec, setRemainingSec] = useState(0);
 
-  // Safety Reporting Modal/Card
+  // Safety Reporting State
   const [showReportCard, setShowReportCard] = useState(false);
   const [reportCategory, setReportCategory] = useState("poor_lighting");
   const [reportDesc, setReportDesc] = useState("");
@@ -83,16 +85,15 @@ export default function SafestRouteScreen() {
     try {
       const perm = await Location.requestForegroundPermissionsAsync();
       if (!perm.granted) {
-        Alert.alert("Location permission required", "Please allow GPS location access to find safest routes.");
+        Alert.alert("GPS permission required", "Please allow GPS location access to detect your current position.");
         return;
       }
       const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       setOriginCoords({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
-      setOriginText(`GPS: ${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`);
+      setOriginText(`My GPS (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
     } catch (_) {
-      // Baseline default (Bengaluru Central)
       setOriginCoords({ latitude: 12.9716, longitude: 77.5946 });
-      setOriginText("Bengaluru Central (Demo GPS)");
+      setOriginText("Bengaluru Central (MG Road)");
     }
   }, []);
 
@@ -100,40 +101,119 @@ export default function SafestRouteScreen() {
     void detectLocation();
   }, [detectLocation]);
 
-  // 2. India-wide Destination Autocomplete
-  const searchPlaces = async (text: string) => {
-    setDestinationText(text);
-    if (text.trim().length < 3) {
-      setSearchResults([]);
+  // 2. Pan-India Place Search (for both Origin and Destination)
+  const searchOriginPlaces = async (text: string) => {
+    setOriginText(text);
+    setOriginCoords(null); // Will re-resolve
+    setActiveSearchField("origin");
+    if (text.trim().length < 2) {
+      setOriginSuggestions([]);
       return;
     }
     setSearching(true);
     try {
       const res = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(text.trim())}`);
-      if (res.data) {
-        setSearchResults(res.data);
-      }
+      if (res.data) setOriginSuggestions(res.data);
     } catch (_) {
     } finally {
       setSearching(false);
     }
   };
 
+  const searchDestPlaces = async (text: string) => {
+    setDestinationText(text);
+    setDestinationCoords(null); // Will re-resolve
+    setActiveSearchField("dest");
+    if (text.trim().length < 2) {
+      setDestSuggestions([]);
+      return;
+    }
+    setSearching(true);
+    try {
+      const res = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(text.trim())}`);
+      if (res.data) setDestSuggestions(res.data);
+    } catch (_) {
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const selectOrigin = (place: PlaceResult) => {
+    setOriginCoords({ latitude: place.latitude, longitude: place.longitude });
+    setOriginText(place.name || place.displayName.split(",")[0]);
+    setOriginSuggestions([]);
+    setActiveSearchField(null);
+  };
+
   const selectDestination = (place: PlaceResult) => {
     setDestinationCoords({ latitude: place.latitude, longitude: place.longitude });
     setDestinationText(place.name || place.displayName.split(",")[0]);
-    setSearchResults([]);
+    setDestSuggestions([]);
+    setActiveSearchField(null);
+  };
+
+  // Helper to parse coordinate strings like "18.52, 73.85"
+  const parseCoordinates = (str: string): { latitude: number; longitude: number } | null => {
+    const match = str.trim().match(/^(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)$/);
+    if (match) {
+      const lat = parseFloat(match[1]);
+      const lng = parseFloat(match[3]);
+      if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+        return { latitude: lat, longitude: lng };
+      }
+    }
+    return null;
   };
 
   // 3. Find & Score Safest Routes
   const findSafestRoutes = async (destLatParam?: number, destLngParam?: number) => {
-    const orig = originCoords || { latitude: 12.9716, longitude: 77.5946 };
-    const dest = destLatParam && destLngParam
-      ? { latitude: destLatParam, longitude: destLngParam }
-      : destinationCoords;
+    setOriginSuggestions([]);
+    setDestSuggestions([]);
+    setActiveSearchField(null);
 
-    if (!dest) {
-      Alert.alert("Destination needed", "Please choose a destination location in India.");
+    // Resolve Origin coordinates if not set
+    let resolvedOrigin = originCoords;
+    if (!resolvedOrigin && originText.trim()) {
+      const parsed = parseCoordinates(originText);
+      if (parsed) {
+        resolvedOrigin = parsed;
+        setOriginCoords(parsed);
+      } else {
+        const found = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(originText.trim())}`);
+        if (found.data && found.data.length > 0) {
+          resolvedOrigin = { latitude: found.data[0].latitude, longitude: found.data[0].longitude };
+          setOriginCoords(resolvedOrigin);
+        }
+      }
+    }
+
+    if (!resolvedOrigin) {
+      resolvedOrigin = { latitude: 12.9716, longitude: 77.5946 };
+      setOriginCoords(resolvedOrigin);
+    }
+
+    // Resolve Destination coordinates if not set
+    let resolvedDest = destLatParam && destLngParam ? { latitude: destLatParam, longitude: destLngParam } : destinationCoords;
+
+    if (!resolvedDest && destinationText.trim()) {
+      const parsed = parseCoordinates(destinationText);
+      if (parsed) {
+        resolvedDest = parsed;
+        setDestinationCoords(parsed);
+      } else {
+        setEvaluating(true);
+        const found = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(destinationText.trim())}`);
+        if (found.data && found.data.length > 0) {
+          resolvedDest = { latitude: found.data[0].latitude, longitude: found.data[0].longitude };
+          setDestinationCoords(resolvedDest);
+          setDestinationText(found.data[0].name || destinationText);
+        }
+      }
+    }
+
+    if (!resolvedDest) {
+      Alert.alert("Destination needed", "Enter any city, town, road, or address in India.");
+      setEvaluating(false);
       return;
     }
 
@@ -141,10 +221,12 @@ export default function SafestRouteScreen() {
     setRoutes([]);
     try {
       const payload = {
-        originLat: orig.latitude,
-        originLng: orig.longitude,
-        destLat: dest.latitude,
-        destLng: dest.longitude,
+        originLat: resolvedOrigin.latitude,
+        originLng: resolvedOrigin.longitude,
+        destLat: resolvedDest.latitude,
+        destLng: resolvedDest.longitude,
+        origin: originText,
+        destination: destinationText,
       };
 
       const res = await post<{
@@ -163,15 +245,15 @@ export default function SafestRouteScreen() {
       setSelectedRouteId(res.data.recommendedRouteId || res.data.routes[0].routeId);
       setEvaluationMeta(res.data.metadata?.disclaimer || "");
 
-      // Also query nearby corridor safety facilities for visualization
-      const midLat = (orig.latitude + dest.latitude) / 2;
-      const midLng = (orig.longitude + dest.longitude) / 2;
-      const facsRes = await api<SafetyFacility[]>(`/api/safety/nearby?latitude=${midLat}&longitude=${midLng}&radiusM=8000`);
+      // Query nearby corridor safety facilities for visualization
+      const midLat = (resolvedOrigin.latitude + resolvedDest.latitude) / 2;
+      const midLng = (resolvedOrigin.longitude + resolvedDest.longitude) / 2;
+      const facsRes = await api<SafetyFacility[]>(`/api/safety/nearby?latitude=${midLat}&longitude=${midLng}&radiusM=15000`);
       if (facsRes.data) {
         setSafetyMarkers(facsRes.data.slice(0, 15));
       }
     } catch (err) {
-      Alert.alert("Error", err instanceof Error ? err.message : "Route scoring failed.");
+      Alert.alert("Error", err instanceof Error ? err.message : "Route calculation failed.");
     } finally {
       setEvaluating(false);
     }
@@ -186,27 +268,27 @@ export default function SafestRouteScreen() {
     setRemainingDistM(selected.distance);
     setRemainingSec(selected.duration);
     Alert.alert(
-      "Navigation Started",
-      `Navigating along the safest recommended route (${selected.safetyScore}/100 Safe Score). SafeHer is actively tracking route deviations.`
+      "Safest Navigation Active",
+      `Navigating along the safest corridor (${selected.safetyScore}/100 Safety Score). SafeHer is actively tracking lighting, police proximity, and route deviations.`
     );
   };
 
   // Submit Citizen Safety Report
   const submitSafetyReport = async () => {
-    if (!originCoords) return;
+    const coords = originCoords || { latitude: 12.9716, longitude: 77.5946 };
     setSubmittingReport(true);
     try {
       const res = await post("/api/safety/reports", {
         category: reportCategory,
-        latitude: originCoords.latitude,
-        longitude: originCoords.longitude,
+        latitude: coords.latitude,
+        longitude: coords.longitude,
         description: reportDesc.trim() || undefined,
       });
 
       if (res.data) {
         Alert.alert(
-          "Report Recorded",
-          "Your community safety concern has been submitted and will inform safety evaluations for fellow commuters."
+          "Report Submitted",
+          "Your community safety concern has been recorded and will inform safety evaluations for fellow commuters."
         );
         setShowReportCard(false);
         setReportDesc("");
@@ -226,42 +308,64 @@ export default function SafestRouteScreen() {
     <ScrollView style={themeStyles.safe} contentContainerStyle={themeStyles.scrollContent}>
       <Header
         title="India-Wide Safest Route"
-        subtitle="Data-driven routing comparing illumination, police posts, medical havens, and crime statistics."
+        subtitle="Universal safety routing across India. Enter ANY start and destination to compare routes by illumination, police reach, and crime statistics."
       />
 
       {/* ─── 1. ORIGIN & DESTINATION SEARCH BAR ─── */}
       <Card>
-        <Text style={themeStyles.h3}>Origin & Destination</Text>
+        <Text style={themeStyles.h3}>Origin & Destination (Pan-India)</Text>
 
-        {/* Origin */}
+        {/* Origin Input (Fully Editable or 1-tap GPS) */}
         <View style={routeStyles.inputRow}>
           <Text style={{ fontSize: 16 }}>📍</Text>
           <TextInput
             style={[themeStyles.input, { flex: 1, marginBottom: 0 }]}
+            placeholder="Starting from (e.g. Pune, Hauz Khas, My GPS)"
             value={originText}
-            editable={false}
+            onChangeText={searchOriginPlaces}
           />
           <TouchableOpacity style={routeStyles.gpsBtn} onPress={detectLocation}>
-            <Text style={routeStyles.gpsBtnText}>GPS</Text>
+            <Text style={routeStyles.gpsBtnText}>📍 GPS</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Destination */}
+        {/* Origin Autocomplete Suggestions */}
+        {activeSearchField === "origin" && originSuggestions.length > 0 && (
+          <View style={routeStyles.suggestionsContainer}>
+            {originSuggestions.map((item) => (
+              <TouchableOpacity
+                key={item.placeId}
+                style={routeStyles.suggestionItem}
+                onPress={() => selectOrigin(item)}
+              >
+                <Text style={routeStyles.suggestionName}>{item.name}</Text>
+                <Text style={routeStyles.suggestionDetails} numberOfLines={1}>
+                  {item.displayName}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+
+        {/* Destination Input (Takes ANY location in India) */}
         <View style={[routeStyles.inputRow, { marginTop: 8 }]}>
           <Text style={{ fontSize: 16 }}>🏁</Text>
           <TextInput
             style={[themeStyles.input, { flex: 1, marginBottom: 0 }]}
-            placeholder="Search destination in India (e.g. Connaught Place, Koramangala)"
+            placeholder="Destination in India (any city, area, landmark)"
             value={destinationText}
-            onChangeText={searchPlaces}
+            onChangeText={searchDestPlaces}
+            onSubmitEditing={() => void findSafestRoutes()}
           />
-          {searching && <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 6 }} />}
+          {searching && activeSearchField === "dest" && (
+            <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 6 }} />
+          )}
         </View>
 
-        {/* Destination Suggestions Dropdown */}
-        {searchResults.length > 0 && (
+        {/* Destination Autocomplete Suggestions */}
+        {activeSearchField === "dest" && destSuggestions.length > 0 && (
           <View style={routeStyles.suggestionsContainer}>
-            {searchResults.map((item) => (
+            {destSuggestions.map((item) => (
               <TouchableOpacity
                 key={item.placeId}
                 style={routeStyles.suggestionItem}
@@ -277,13 +381,19 @@ export default function SafestRouteScreen() {
         )}
 
         {/* Quick Indian Metros Shortcuts */}
-        <Text style={[themeStyles.caption, { marginTop: 10, fontWeight: "600" }]}>Quick Test Indian Hubs:</Text>
+        <Text style={[themeStyles.caption, { marginTop: 10, fontWeight: "600" }]}>Quick Pan-India Hubs:</Text>
         <View style={routeStyles.quickTags}>
           {[
-            { label: "Bengaluru Koramangala", lat: 12.9352, lng: 77.6245 },
-            { label: "New Delhi Connaught Pl", lat: 28.6328, lng: 77.2197 },
-            { label: "Noida Sector 18", lat: 28.5708, lng: 77.3261 },
+            { label: "Pune", lat: 18.5204, lng: 73.8567 },
             { label: "Mumbai Bandra", lat: 19.0552, lng: 72.8347 },
+            { label: "Delhi Connaught Pl", lat: 28.6328, lng: 77.2197 },
+            { label: "Bengaluru Koramangala", lat: 12.9352, lng: 77.6245 },
+            { label: "Hyderabad Banjara", lat: 17.4156, lng: 78.4357 },
+            { label: "Chennai T. Nagar", lat: 13.0418, lng: 80.2341 },
+            { label: "Kolkata Park St", lat: 22.5518, lng: 88.3524 },
+            { label: "Jaipur Pink City", lat: 26.9157, lng: 75.8189 },
+            { label: "Chandigarh Sec 17", lat: 30.7415, lng: 76.7794 },
+            { label: "Kochi Marine Drive", lat: 9.9816, lng: 76.2799 },
           ].map((tag) => (
             <TouchableOpacity
               key={tag.label}
@@ -304,7 +414,7 @@ export default function SafestRouteScreen() {
         <Action
           label={evaluating ? "Evaluating Multi-Route Safety…" : "🛡️ Calculate Safest Routes"}
           loading={evaluating}
-          disabled={evaluating || !destinationCoords}
+          disabled={evaluating || !destinationText.trim()}
           onPress={() => void findSafestRoutes()}
         />
       </Card>
