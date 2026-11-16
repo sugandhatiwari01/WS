@@ -1,388 +1,335 @@
+/**
+ * Walk With Me — Route Deviation Alert Screen
+ *
+ * Tracks the user's real-time GPS position along a chosen route.
+ * Alerts family/police if the user:
+ *   • Deviates > 300 m from the straight-line path (150 m in high-risk mode)
+ *   • Stops for > 3 minutes without moving (90 s in high-risk mode)
+ *
+ * On a "stopped" alert the user can escalate directly to SOS.
+ */
+
 import { router } from "expo-router";
-import * as Location from "expo-location";
-import * as WebBrowser from "expo-web-browser";
-import { useEffect, useState } from "react";
-import { Alert, ScrollView, Text, TextInput, View } from "react-native";
+import { useCallback, useState } from "react";
+import {
+  Alert,
+  Linking,
+  ScrollView,
+  Switch,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
 import { Action, Badge, Card, Divider, Header } from "@/components/ui";
-import { Contact, getContacts, saveContacts } from "@/lib/storage";
-import { api, post } from "@/lib/api";
-import { isInternetUnavailable, openSmsComposer } from "@/lib/safety-sms";
+import { useAuth } from "@/lib/auth";
+import { useSos } from "@/hooks/useSos";
+import { useWalkSafe } from "@/hooks/useWalkSafe";
+import { useSocket } from "@/hooks/useSocket";
+import { post } from "@/lib/api";
+import { getContacts } from "@/lib/storage";
 import { colors, styles } from "@/lib/theme";
 
-type ServerContact = { _id: string; name: string; phone?: string; email?: string };
-type RideSmsResult = {
-  smsConfigured: boolean;
-  sentCount: number;
-  results: { name: string; phone: string; ok: boolean }[];
-};
+export default function WalkWithMeScreen() {
+  const { user } = useAuth();
+  const { startCountdown } = useSos();
 
-type UberRideData = {
-  service?: string;
-  driverName?: string;
-  driverPhone?: string;
-  driverRating?: string;
-  vehicle?: string;
-  plate?: string;
-  tripId?: string;
-  destination?: string;
-  etaMinutes?: number;
-  currentLatitude?: number;
-  currentLongitude?: number;
-};
+  /* ─── Form state ──────────────────────────────────────── */
+  const [destinationName, setDestinationName] = useState("");
+  const [destinationLat, setDestinationLat] = useState("");
+  const [destinationLng, setDestinationLng] = useState("");
+  const [estimatedMinutes, setEstimatedMinutes] = useState("20");
+  const [highRiskMode, setHighRiskMode] = useState(false);
 
-function uniquePhones(contacts: Contact[]) {
-  return [...new Set(contacts.flatMap((contact) => (contact.phone ? [contact.phone.trim()] : [])).filter(Boolean))];
-}
+  /* ─── Walk With Me hook ────────────────────────────────── */
+  const {
+    walkState,
+    session,
+    currentCoords,
+    distanceToDestM,
+    elapsedLabel,
+    loading,
+    startWalk,
+    markArrived,
+    cancelWalk,
+    handleSocketEvent,
+  } = useWalkSafe({
+    onStoppedEscalate: () => startCountdown("LEVEL_1", "TIMER"),
+  });
 
-export default function RideScreen() {
-  const [contacts, setContacts] = useState<Contact[]>([]);
-  const [service, setService] = useState("Uber");
-  const [driverName, setDriverName] = useState("");
-  const [driverPhone, setDriverPhone] = useState("");
-  const [vehicle, setVehicle] = useState("");
-  const [plate, setPlate] = useState("");
-  const [tripReference, setTripReference] = useState("");
-  const [destination, setDestination] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [sending, setSending] = useState(false);
-  const [contactWarning, setContactWarning] = useState("");
+  /* ─── Socket.IO real-time ──────────────────────────────── */
+  useSocket({
+    userId: user?._id,
+    onEvent: handleSocketEvent,
+  });
 
-  /* ─── Uber Integration State ───────────────────────────── */
-  const [uberConnected, setUberConnected] = useState(false);
-  const [uberLoading, setUberLoading] = useState(false);
-  const [activeUberRide, setActiveUberRide] = useState<UberRideData | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    void getContacts()
-      .then((saved) => {
-        if (active) setContacts(saved);
-      })
-      .catch(() => {
-        if (active) Alert.alert("Contacts unavailable", "Saved trusted contacts could not be loaded from this device.");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
+  /* ─── Automated SMS to contacts ────────────────────────── */
+  const sendStartSms = useCallback(async (destName: string, estMin: number) => {
+    try {
+      const contacts = await getContacts();
+      const phones = contacts.flatMap((c) => (c.phone ? [c.phone.trim()] : []));
+      if (!phones.length) return;
+      await post("/api/notify/trip-sms", {
+        userName: user?.name,
+        destination: destName,
+        estimatedMinutes: estMin,
+        phones,
+        message: `${user?.name ?? "Someone"} has started a walk to "${destName}" (est. ${estMin} min). You'll be automatically notified if they deviate from the route or stop unexpectedly. — SafeHer`,
       });
+    } catch (_) {}
+  }, [user?.name]);
 
-    void api<ServerContact[]>("/api/contacts")
-      .then(async (result) => {
-        if (!active) return;
-        if (!result.data) {
-          setContactWarning("Using contacts saved on this device. The server contact list could not be refreshed.");
-          return;
-        }
-        const synced = result.data.map((contact) => ({
-          id: contact._id,
-          name: contact.name,
-          phone: contact.phone,
-          email: contact.email,
-        }));
-        setContacts(synced);
-        await saveContacts(synced);
-        setContactWarning("");
-      })
-      .catch((error) => {
-        if (active) {
-          setContactWarning(
-            error instanceof Error
-              ? `Using contacts saved on this device. ${error.message}`
-              : "Using contacts saved on this device. The server contact list could not be refreshed."
-          );
-        }
+  const sendArrivalSms = useCallback(async (destName: string) => {
+    try {
+      const contacts = await getContacts();
+      const phones = contacts.flatMap((c) => (c.phone ? [c.phone.trim()] : []));
+      if (!phones.length) return;
+      await post("/api/notify/trip-arrival", {
+        userName: user?.name,
+        destination: destName,
+        phones,
+        message: `✅ ${user?.name ?? "Someone"} has arrived safely at "${destName}". — SafeHer`,
       });
+    } catch (_) {}
+  }, [user?.name]);
 
-    // Check Uber connection status
-    void api<{ connected: boolean; configured: boolean; demoMode: boolean }>("/api/uber/status").then((res) => {
-      if (active && res.data?.connected) {
-        setUberConnected(true);
-      }
+  /* ─── Start handler ─────────────────────────────────────── */
+  const handleStart = async () => {
+    if (!destinationName.trim()) {
+      Alert.alert("Destination required", "Enter where you're walking to.");
+      return;
+    }
+    const lat = parseFloat(destinationLat);
+    const lng = parseFloat(destinationLng);
+    const hasCoords = !isNaN(lat) && !isNaN(lng);
+    if (!hasCoords) {
+      Alert.alert(
+        "No coordinates",
+        "Without destination coordinates, only the stopped alert will work (not deviation). Continue?",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Continue anyway",
+            onPress: async () => {
+              await startWalk({
+                destinationName: destinationName.trim(),
+                destinationLat: 0,
+                destinationLng: 0,
+                estimatedMinutes: parseInt(estimatedMinutes, 10) || 20,
+                highRiskMode,
+              });
+              void sendStartSms(destinationName.trim(), parseInt(estimatedMinutes, 10) || 20);
+            },
+          },
+        ]
+      );
+      return;
+    }
+    await startWalk({
+      destinationName: destinationName.trim(),
+      destinationLat: lat,
+      destinationLng: lng,
+      estimatedMinutes: parseInt(estimatedMinutes, 10) || 20,
+      highRiskMode,
     });
-
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  /* ─── Uber Integration Actions ─────────────────────────── */
-  const connectUber = async () => {
-    setUberLoading(true);
-    try {
-      const res = await api<{ url: string; demoMode?: boolean }>("/api/uber/auth-url");
-      if (res.error || !res.data) {
-        Alert.alert("Uber connection error", res.error || "Could not retrieve Uber login URL.");
-        return;
-      }
-
-      if (res.data.demoMode) {
-        // Exchange demo code
-        const exchange = await post<{ ok: boolean; message: string }>("/api/uber/exchange-token", {
-          code: "mock_uber_auth_code_demo",
-        });
-        if (exchange.data?.ok) {
-          setUberConnected(true);
-          Alert.alert("Uber Connected", "Your Uber account is linked. Fetching active ride details...");
-          await fetchUberRide();
-        }
-        return;
-      }
-
-      // Live OAuth2
-      const authResult = await WebBrowser.openAuthSessionAsync(res.data.url, "safeher://uber-callback");
-      if (authResult.type === "success" && authResult.url) {
-        const urlParams = new URL(authResult.url);
-        const code = urlParams.searchParams.get("code");
-        if (code) {
-          const exchange = await post<{ ok: boolean }>("/api/uber/exchange-token", { code });
-          if (exchange.data?.ok) {
-            setUberConnected(true);
-            Alert.alert("Uber Connected", "Your Uber account is linked.");
-            await fetchUberRide();
-          }
-        }
-      }
-    } catch (e) {
-      Alert.alert("Uber connection failed", e instanceof Error ? e.message : "Unable to link Uber account.");
-    } finally {
-      setUberLoading(false);
-    }
+    void sendStartSms(destinationName.trim(), parseInt(estimatedMinutes, 10) || 20);
   };
 
-  const fetchUberRide = async () => {
-    setUberLoading(true);
-    try {
-      const res = await api<{ active: boolean; message?: string; ride?: UberRideData }>("/api/uber/current-ride");
-      if (res.data?.active && res.data.ride) {
-        const ride = res.data.ride;
-        setActiveUberRide(ride);
-        setService(ride.service || "Uber");
-        setDriverName(ride.driverName || "");
-        setDriverPhone(ride.driverPhone || "");
-        setVehicle(ride.vehicle || "");
-        setPlate(ride.plate || "");
-        setTripReference(ride.tripId || "");
-        setDestination(ride.destination || "");
-        Alert.alert(
-          "Uber Ride Found",
-          `Driver: ${ride.driverName}\nVehicle: ${ride.vehicle} (${ride.plate})\nTap 'Send details to family' to notify contacts automatically.`
-        );
-      } else {
-        Alert.alert("No Active Ride", res.data?.message || "No ongoing Uber trip was detected on this account.");
-      }
-    } catch (e) {
-      Alert.alert("Failed to fetch Uber ride", e instanceof Error ? e.message : "Request failed.");
-    } finally {
-      setUberLoading(false);
-    }
+  /* ─── Arrival handler ───────────────────────────────────── */
+  const handleArrived = async () => {
+    const dest = session?.destinationName ?? destinationName.trim();
+    await markArrived();
+    void sendArrivalSms(dest);
+    Alert.alert("Safe arrival confirmed", "Your contacts have been notified that you arrived safely. 🎉");
   };
 
-  const autoShareUberRideWithFamily = async () => {
-    const phones = uniquePhones(contacts);
-    if (!phones.length) {
-      Alert.alert("No contacts", "Add trusted contacts with phone numbers first.");
-      return;
-    }
+  /* ─── State badge ───────────────────────────────────────── */
+  const badgeVariant = (() => {
+    if (walkState === "active") return "success" as const;
+    if (walkState === "deviation" || walkState === "stopped") return "warning" as const;
+    if (walkState === "arrived") return "success" as const;
+    return "neutral" as const;
+  })();
 
-    setSending(true);
-    try {
-      const res = await post<{ ok: boolean; sentCount: number; results: unknown[] }>("/api/uber/share-ride", {
-        ride: activeUberRide || {
-          service: service.trim() || "Uber",
-          driverName: driverName.trim(),
-          driverPhone: driverPhone.trim(),
-          vehicle: vehicle.trim(),
-          plate: plate.trim(),
-          tripReference: tripReference.trim(),
-          destination: destination.trim(),
-        },
-      });
+  const badgeLabel = (() => {
+    if (walkState === "active") return "WALK ACTIVE";
+    if (walkState === "deviation") return "⚠️ DEVIATION";
+    if (walkState === "stopped") return "⚠️ STOPPED";
+    if (walkState === "arrived") return "✅ ARRIVED";
+    return "IDLE";
+  })();
 
-      if (res.data?.ok) {
-        Alert.alert(
-          "Ride Details Sent Automatically",
-          `Uber ride details were sent automatically to your family & trusted contacts without requiring manual confirmation.`
-        );
-      } else {
-        Alert.alert("Send failed", res.error || "Server could not send the automated SMS.");
-      }
-    } catch (e) {
-      Alert.alert("Send failed", e instanceof Error ? e.message : "Could not complete automated send.");
-    } finally {
-      setSending(false);
-    }
-  };
-
-  /* ─── Manual or Fallback Ride Notification ─────────────── */
-  const notifyContacts = async () => {
-    if (!driverName.trim() || !vehicle.trim() || !plate.trim()) {
-      Alert.alert("Ride details needed", "Enter the driver name, vehicle, and license plate before sharing.");
-      return;
-    }
-    const phones = uniquePhones(contacts);
-    if (!phones.length) {
-      Alert.alert("No phone contacts", "Add trusted contacts with phone numbers before sharing ride details.");
-      return;
-    }
-
-    setSending(true);
-    try {
-      let coordinates: { latitude: number; longitude: number } | null = null;
-      try {
-        const permission = await Location.getForegroundPermissionsAsync();
-        const granted = permission.granted || (await Location.requestForegroundPermissionsAsync()).granted;
-        if (granted) {
-          const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-          coordinates = { latitude: position.coords.latitude, longitude: position.coords.longitude };
-        }
-      } catch (_) {}
-
-      let internetUnavailable = false;
-      try {
-        internetUnavailable = await isInternetUnavailable();
-      } catch (_) {}
-
-      if (!internetUnavailable) {
-        // AUTOMATED: Send directly via backend API without human intervention
-        const result = await post<RideSmsResult>("/api/notify/ride-sms", {
-          service: service.trim() || "Cab",
-          driverName: driverName.trim(),
-          driverPhone: driverPhone.trim() || undefined,
-          vehicle: vehicle.trim(),
-          plate: plate.trim(),
-          tripReference: tripReference.trim() || undefined,
-          destination: destination.trim() || undefined,
-          latitude: coordinates?.latitude,
-          longitude: coordinates?.longitude,
-        });
-
-        if (result.data?.sentCount && result.data.sentCount > 0) {
-          Alert.alert(
-            "Ride Details Sent Automatically",
-            `Your ride details were sent to ${result.data.sentCount} trusted contact(s) via automated SMS without requiring manual taps.`
-          );
-          return;
-        }
-
-        if (result.data && !result.data.smsConfigured) {
-          Alert.alert(
-            "Server SMS not configured",
-            "The backend SMS provider (Fast2SMS) is not configured. Falling back to phone SMS app."
-          );
-        }
-      }
-
-      // Offline fallback: Native SMS composer
-      const locationLine = coordinates
-        ? `Current location: https://maps.google.com/?q=${coordinates.latitude},${coordinates.longitude}`
-        : "Current location is unavailable.";
-      const message = [
-        `SafeHer ride check-in (${service.trim() || "Cab"})`,
-        `Driver: ${driverName.trim()}`,
-        driverPhone.trim() ? `Driver phone: ${driverPhone.trim()}` : "",
-        `Vehicle: ${vehicle.trim()}`,
-        `License plate: ${plate.trim().toUpperCase()}`,
-        tripReference.trim() ? `Trip reference: ${tripReference.trim()}` : "",
-        destination.trim() ? `Destination: ${destination.trim()}` : "",
-        locationLine,
-        "I am sharing these details for my safety. Please check in with me if I do not confirm arrival.",
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      await openSmsComposer(phones, message);
-    } catch (error) {
-      Alert.alert("Ride alert failed", error instanceof Error ? error.message : "The ride details could not be shared.");
-    } finally {
-      setSending(false);
-    }
-  };
-
+  /* ─── Render ─────────────────────────────────────────────── */
   return (
     <ScrollView style={styles.safe} contentContainerStyle={styles.scrollContent}>
       <Header
-        title="Share cab details"
-        subtitle="Send your ride information to trusted contacts automatically before or during a trip."
+        title="Walk With Me"
+        subtitle="Real-time route deviation and stop alerts. Your contacts are notified the moment something seems wrong."
       />
 
-      {/* ─── UBER INTEGRATION CARD ─── */}
-      <Card>
-        <View style={styles.spaceBetween}>
-          <Text style={styles.h2}>🚗 Uber Integration</Text>
-          <Badge
-            label={uberConnected ? "UBER CONNECTED" : "NOT LINKED"}
-            variant={uberConnected ? "success" : "neutral"}
-          />
-        </View>
-        <Text style={[styles.subtitle, { marginTop: 6 }]}>
-          Auto-fetch driver and vehicle details from your Uber app and share with your family automatically.
-        </Text>
-
-        {!uberConnected ? (
-          <Action
-            label={uberLoading ? "Connecting to Uber..." : "Connect Uber Account"}
-            loading={uberLoading}
-            onPress={() => void connectUber()}
-          />
-        ) : (
-          <>
-            <Action
-              label={uberLoading ? "Fetching ride..." : "🔄 Sync Active Uber Ride"}
-              secondary
-              loading={uberLoading}
-              onPress={() => void fetchUberRide()}
-            />
-            {activeUberRide && (
-              <View style={{ marginTop: 10, padding: 10, backgroundColor: colors.border, borderRadius: 8 }}>
-                <Text style={{ fontWeight: "700" }}>Driver: {activeUberRide.driverName} {activeUberRide.driverRating ? `(${activeUberRide.driverRating}★)` : ""}</Text>
-                <Text style={{ marginTop: 2 }}>Vehicle: {activeUberRide.vehicle} • {activeUberRide.plate}</Text>
-                {activeUberRide.destination ? <Text style={{ marginTop: 2 }}>To: {activeUberRide.destination}</Text> : null}
-                <View style={{ marginTop: 10 }}>
-                  <Action
-                    label={sending ? "Sending..." : "🚀 Auto-Send Uber Details to Family"}
-                    loading={sending}
-                    onPress={() => void autoShareUberRideWithFamily()}
-                  />
-                </View>
-              </View>
-            )}
-          </>
-        )}
-      </Card>
-
-      {/* ─── MANUAL / EDIT RIDE DETAILS ─── */}
-      <Card>
-        <Text style={styles.h3}>Ride and driver details</Text>
-        <Text style={[styles.caption, { marginTop: 6 }]}>
-          All ride details are sent automatically to your contacts via server SMS when online.
-        </Text>
-        <TextInput style={styles.input} placeholder="Ride service (e.g. Uber, Ola, Rapido)" value={service} onChangeText={setService} />
-        <TextInput style={styles.input} placeholder="Driver name" value={driverName} onChangeText={setDriverName} />
-        <TextInput style={styles.input} placeholder="Driver phone (optional)" value={driverPhone} onChangeText={setDriverPhone} keyboardType="phone-pad" />
-        <TextInput style={styles.input} placeholder="Vehicle make/model (e.g. Maruti Dzire White)" value={vehicle} onChangeText={setVehicle} />
-        <TextInput style={styles.input} placeholder="License plate / registration (e.g. DL 01 AB 1234)" value={plate} onChangeText={setPlate} autoCapitalize="characters" />
-        <TextInput style={styles.input} placeholder="Trip reference (optional)" value={tripReference} onChangeText={setTripReference} />
-        <TextInput style={styles.input} placeholder="Destination (optional)" value={destination} onChangeText={setDestination} />
-        <Divider />
-        <Text style={styles.h3}>Trusted recipients</Text>
-        {contactWarning ? <Text style={[styles.caption, { marginTop: 6 }]}>{contactWarning}</Text> : null}
-        {loading ? (
-          <Text style={[styles.caption, { marginTop: 8 }]}>Loading saved contacts…</Text>
-        ) : contacts.filter((contact) => Boolean(contact.phone)).length === 0 ? (
-          <Action label="Add a trusted contact" secondary onPress={() => router.push("/contacts" as never)} />
-        ) : (
-          contacts.filter((contact) => Boolean(contact.phone)).map((contact) => (
-            <Text key={contact.id} style={[styles.subtitle, { marginTop: 8 }]}>
-              {contact.name} · {contact.phone}
+      {/* Status bar */}
+      {walkState !== "idle" && (
+        <Card danger={walkState === "deviation" || walkState === "stopped"}>
+          <View style={styles.spaceBetween}>
+            <Text style={[styles.h2, {
+              color: walkState === "deviation" || walkState === "stopped" ? colors.red : colors.ink
+            }]}>
+              {walkState === "deviation" ? "⚠️ Off Route" :
+               walkState === "stopped"   ? "⚠️ You Stopped" :
+               walkState === "arrived"   ? "✅ Arrived" :
+               "🚶 Walking"}
             </Text>
-          ))
-        )}
-        <Action
-          label={sending ? "Sharing ride details automatically…" : "Notify my trusted contacts (Automated)"}
-          loading={sending}
-          disabled={loading || !contacts.some((contact) => contact.phone)}
-          onPress={() => void notifyContacts()}
-        />
-      </Card>
+            <Badge label={badgeLabel} variant={badgeVariant} />
+          </View>
+
+          {session && (
+            <Text style={[styles.subtitle, { marginTop: 6 }]}>
+              To: {session.destinationName}
+              {highRiskMode ? " · ⚡ High-risk mode" : ""}
+            </Text>
+          )}
+
+          {walkState === "active" || walkState === "deviation" || walkState === "stopped" ? (
+            <Text style={[styles.caption, { marginTop: 4 }]}>
+              Elapsed: {elapsedLabel}
+              {distanceToDestM !== null ? `  ·  ~${distanceToDestM < 1000 ? `${distanceToDestM} m` : `${(distanceToDestM / 1000).toFixed(1)} km`} to go` : ""}
+            </Text>
+          ) : null}
+
+          {currentCoords && (
+            <View style={{ marginTop: 8 }}>
+              <Text style={styles.caption}>
+                📍 {currentCoords.latitude.toFixed(5)}, {currentCoords.longitude.toFixed(5)} · Live
+              </Text>
+              <Action
+                label="Open live map"
+                secondary
+                onPress={() =>
+                  Linking.openURL(
+                    `https://maps.google.com/?q=${currentCoords.latitude},${currentCoords.longitude}`
+                  )
+                }
+              />
+            </View>
+          )}
+
+          <Divider />
+
+          {(walkState === "active" || walkState === "deviation" || walkState === "stopped") && (
+            <>
+              <Action
+                label="✅ I've Arrived Safely"
+                loading={loading}
+                onPress={() => void handleArrived()}
+              />
+              <Action
+                label="Cancel walk"
+                secondary
+                loading={loading}
+                onPress={() => void cancelWalk()}
+              />
+              <Action
+                label="🚨 Trigger SOS"
+                danger
+                onPress={() => startCountdown("LEVEL_1", "TIMER")}
+              />
+            </>
+          )}
+
+          {walkState === "arrived" && (
+            <Action label="Start a new walk" secondary onPress={() => {
+              setDestinationName("");
+              setDestinationLat("");
+              setDestinationLng("");
+              setEstimatedMinutes("20");
+              setHighRiskMode(false);
+            }} />
+          )}
+        </Card>
+      )}
+
+      {/* Setup card — shown only when idle/arrived */}
+      {(walkState === "idle" || walkState === "arrived") && (
+        <Card>
+          <Text style={styles.h2}>Plan your walk</Text>
+          <Text style={[styles.subtitle, { marginTop: 6 }]}>
+            Enter your destination. If you deviate from the route or stop unexpectedly,
+            your trusted contacts and police are notified automatically.
+          </Text>
+
+          <TextInput
+            style={styles.input}
+            placeholder="Destination name (e.g. Home, Metro Station)"
+            value={destinationName}
+            onChangeText={setDestinationName}
+          />
+          <TextInput
+            style={styles.input}
+            placeholder="Destination latitude (optional, e.g. 28.6139)"
+            value={destinationLat}
+            onChangeText={setDestinationLat}
+            keyboardType="numeric"
+          />
+          <TextInput
+            style={styles.input}
+            placeholder="Destination longitude (optional, e.g. 77.2090)"
+            value={destinationLng}
+            onChangeText={setDestinationLng}
+            keyboardType="numeric"
+          />
+          <TextInput
+            style={styles.input}
+            placeholder="Estimated walk time in minutes (default 20)"
+            value={estimatedMinutes}
+            onChangeText={setEstimatedMinutes}
+            keyboardType="numeric"
+          />
+
+          <Divider />
+
+          <View style={[styles.spaceBetween, { marginVertical: 8 }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.h3}>⚡ High-risk mode</Text>
+              <Text style={[styles.caption, { marginTop: 2 }]}>
+                Lowers deviation threshold to 150 m and stopped threshold to 90 s.
+              </Text>
+            </View>
+            <Switch
+              value={highRiskMode}
+              onValueChange={setHighRiskMode}
+              trackColor={{ true: colors.red }}
+            />
+          </View>
+
+          <Divider />
+
+          <Text style={[styles.caption, { marginBottom: 8 }]}>
+            Your contacts will receive an automated SMS when you start and when you arrive.
+            No action needed — it's fully automatic.
+          </Text>
+
+          <Action
+            label={loading ? "Starting walk…" : "🚶 Start Walk With Me"}
+            loading={loading}
+            disabled={loading || !destinationName.trim()}
+            onPress={() => void handleStart()}
+          />
+        </Card>
+      )}
+
+      {/* How it works */}
+      {walkState === "idle" && (
+        <Card>
+          <Text style={styles.h3}>How it works</Text>
+          <Text style={[styles.caption, { marginTop: 6, lineHeight: 20 }]}>
+            1. Enter your destination and estimated walk time.{"\n"}
+            2. Tap <Text style={{ fontWeight: "700" }}>Start Walk</Text> — your GPS is tracked live every 10 seconds.{"\n"}
+            3. If you deviate more than 300 m from your route, your contacts are alerted instantly.{"\n"}
+            4. If you stop for more than 3 minutes without moving, an alert fires automatically.{"\n"}
+            5. Tap <Text style={{ fontWeight: "700" }}>I've Arrived Safely</Text> to send an all-clear.{"\n\n"}
+            In high-risk mode thresholds drop to 150 m / 90 s.
+          </Text>
+        </Card>
+      )}
 
       <Action label="← Back" secondary onPress={() => router.back()} />
       <View style={{ height: 30 }} />

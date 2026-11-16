@@ -9,7 +9,8 @@ const contacts = require("./routes/contacts");
 const police = require("./routes/police");
 const notify = require("./routes/notify");
 const users = require("./routes/users");
-const uber = require("./routes/uber");
+const walksafe = require("./routes/walksafe");
+const safeRoute = require("./routes/safeRoute");
 const { notFound, errorHandler } = require("./middleware/errors");
 const { isConfigured } = require("./db/supabase");
 
@@ -59,7 +60,9 @@ app.use("/api/family", contacts);    // /api/family/emergencies alias
 app.use("/api/police", police);
 app.use("/api/notify", notify);
 app.use("/api/users", users);
-app.use("/api/uber", uber);
+app.use("/api/walksafe", walksafe);
+app.use("/api/routes", safeRoute);
+app.use("/api/safety", safeRoute);
 
 /* ─── Legacy path aliases (keep for backwards compat) ───── */
 app.use("/auth", auth);

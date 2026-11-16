@@ -81,6 +81,17 @@ function useSosController() {
 
   /* ─── location helpers ─────────────────────────────────── */
 
+  const stopLiveLocationTracking = useCallback(() => {
+    if (locationTimer.current) {
+      clearInterval(locationTimer.current);
+      locationTimer.current = null;
+    }
+    if (locationWatcherRef.current) {
+      locationWatcherRef.current.remove();
+      locationWatcherRef.current = null;
+    }
+  }, []);
+
   const getCurrentCoords = useCallback(async (requestPermission = true): Promise<{ latitude: number; longitude: number } | null> => {
     try {
       const currentPermission = await Location.getForegroundPermissionsAsync();
@@ -109,13 +120,19 @@ function useSosController() {
           longitude: coords.longitude,
         });
         if (result.error) {
-          setLocationStr(`${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)} · update failed`);
+          // 404 means the emergency no longer exists server-side — stop tracking silently
+          if (result.status === 404 || (typeof result.error === "string" && result.error.includes("not found"))) {
+            stopLiveLocationTracking();
+            setLocationStr("Location tracking stopped — SOS no longer active on server");
+          } else {
+            setLocationStr(`${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)} · update failed`);
+          }
         }
       } catch {
         setLocationStr(`${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)} · update failed`);
       }
     },
-    [getCurrentCoords]
+    [getCurrentCoords, stopLiveLocationTracking]
   );
 
   const startLiveLocationTracking = useCallback(async (id: string) => {
@@ -130,10 +147,15 @@ function useSosController() {
       if (permission.granted) {
         const sub = await Location.watchPositionAsync(
           { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 5 },
-          (pos) => {
+          async (pos) => {
             const { latitude, longitude } = pos.coords;
             setLocationStr(`${latitude.toFixed(5)}, ${longitude.toFixed(5)} · Live`);
-            void post(`/api/emergencies/${id}/location`, { latitude, longitude });
+            const result = await post(`/api/emergencies/${id}/location`, { latitude, longitude });
+            // If the emergency is gone on the server, stop tracking
+            if (result.status === 404) {
+              stopLiveLocationTracking();
+              setLocationStr("Location tracking stopped — SOS no longer active on server");
+            }
           }
         );
         locationWatcherRef.current = sub;
@@ -144,18 +166,7 @@ function useSosController() {
     locationTimer.current = setInterval(() => {
       void updateLocationForEmergency(id);
     }, LOCATION_UPDATE_INTERVAL_MS);
-  }, [updateLocationForEmergency]);
-
-  const stopLiveLocationTracking = useCallback(() => {
-    if (locationTimer.current) {
-      clearInterval(locationTimer.current);
-      locationTimer.current = null;
-    }
-    if (locationWatcherRef.current) {
-      locationWatcherRef.current.remove();
-      locationWatcherRef.current = null;
-    }
-  }, []);
+  }, [updateLocationForEmergency, stopLiveLocationTracking]);
 
   /* ─── countdown logic ──────────────────────────────────── */
 

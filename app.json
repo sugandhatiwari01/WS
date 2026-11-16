@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "name": "SAFEHER",
+    "slug": "safeher-workspace",
+    "version": "1.0.0",
+    "extra": {
+      "eas": {
+        "projectId": "8bef3613-e205-427a-9b34-6b5b232abac3"
+      }
+    },
+    "android": {
+      "package": "com.sugandhat01.safeherworkspace"
+    }
+  }
+}

@@ -134,6 +134,48 @@ export async function uploadAudio<T>(path: string, uri: string): Promise<ApiResu
   }
 }
 
+/** Multipart photo upload */
+export async function uploadPhoto<T>(path: string, uri: string): Promise<ApiResult<T>> {
+  if (!API_URL) return { offline: true, error: "Backend URL is not configured." };
+  const token = await getToken();
+  const form = new FormData();
+  const filename = `proof-${Date.now()}.jpg`;
+
+  try {
+    if (Platform.OS === "web" || uri.startsWith("blob:") || uri.startsWith("data:") || uri.startsWith("http")) {
+      const blobResponse = await fetch(uri);
+      const blob = await blobResponse.blob();
+      form.append("photo", blob, filename);
+    } else {
+      form.append("photo", {
+        uri,
+        name: filename,
+        type: "image/jpeg",
+      } as unknown as Blob);
+    }
+  } catch (err) {
+    console.warn("Photo file preparation error:", err);
+    form.append("photo", {
+      uri,
+      name: filename,
+      type: "image/jpeg",
+    } as unknown as Blob);
+  }
+
+  try {
+    const response = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: token ? { Authorization: "Bearer " + token } : {},
+      body: form,
+    });
+    const payload = await response.json().catch(() => undefined);
+    if (!response.ok) return { offline: false, status: response.status, error: payload?.error || `Photo upload failed (${response.status})` };
+    return { offline: false, status: response.status, data: payload as T };
+  } catch {
+    return { offline: true, error: "Unable to upload the photo." };
+  }
+}
+
 /** Retry queued offline requests */
 export async function flushQueue() {
   const raw = await AsyncStorage.getItem(QUEUE_KEY);

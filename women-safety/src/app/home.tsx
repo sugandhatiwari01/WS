@@ -10,6 +10,7 @@ import { api, post, uploadAudio } from "@/lib/api";
 import { useSos } from "@/hooks/useSos";
 import { useSocket } from "@/hooks/useSocket";
 import FakeCallModal from "@/components/fake-call-modal";
+import LiveMapView, { PoliceStationMarker } from "@/components/live-map-view";
 import { colors, styles } from "@/lib/theme";
 
 type IncomingEmergency = {
@@ -42,6 +43,9 @@ export default function Home() {
   const [fakeCallModalVisible, setFakeCallModalVisible] = useState(false);
   const [audioUploading, setAudioUploading] = useState(false);
   const [pendingAudio, setPendingAudio] = useState<PendingAudio | null>(null);
+  const [nearbyStations, setNearbyStations] = useState<PoliceStationMarker[]>([]);
+  const [userCoords, setUserCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [showMap, setShowMap] = useState(false);
   const [readiness, setReadiness] = useState({
     loading: true,
     backend: null as boolean | null,
@@ -53,6 +57,8 @@ export default function Home() {
 
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(recorder);
+  // Separate recorder instance for auto-recording so it never conflicts with manual recording
+  const autoRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const pendingAudioKey = user?._id ? `safeher-pending-audio-${user._id}` : null;
 
   useEffect(() => {
@@ -106,9 +112,29 @@ export default function Home() {
     },
   });
 
+  const loadNearbyStations = useCallback(async () => {
+    try {
+      let lat: number | undefined;
+      let lng: number | undefined;
+      const perm = await Location.getForegroundPermissionsAsync();
+      if (perm.granted) {
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        lat = pos.coords.latitude;
+        lng = pos.coords.longitude;
+        setUserCoords({ latitude: lat, longitude: lng });
+      }
+      const queryParam = lat != null && lng != null ? `?latitude=${lat}&longitude=${lng}` : "";
+      const result = await api<PoliceStationMarker[]>(`/api/police/stations${queryParam}`);
+      if (result.data) {
+        setNearbyStations(result.data);
+      }
+    } catch (_) {}
+  }, []);
+
   /* ─── Init ─────────────────────────────────────────────── */
   useEffect(() => {
     void Promise.resolve().then(checkReadiness);
+    void loadNearbyStations();
 
     // Load incoming family alerts via polling fallback (also updated via socket)
     const loadIncoming = async () => {
@@ -121,7 +147,7 @@ export default function Home() {
     return () => {
       clearInterval(pollTimer);
     };
-  }, [checkReadiness]);
+  }, [checkReadiness, loadNearbyStations]);
 
   /* ─── SOS button press ─────────────────────────────────── */
   const handleSosPress = () => {
@@ -165,16 +191,17 @@ export default function Home() {
       try {
         const permission = await requestRecordingPermissionsAsync();
         if (!permission.granted || cancelled) return;
+        // Use the dedicated auto-recorder (never conflicts with manual recording)
         await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-        await recorder.prepareToRecordAsync();
-        recorder.record();
+        await autoRecorder.prepareToRecordAsync();
+        autoRecorder.record();
 
         setTimeout(async () => {
           if (cancelled) return;
           try {
-            await recorder.stop();
+            await autoRecorder.stop();
             await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
-            const uri = recorder.uri || recorderState.url;
+            const uri = autoRecorder.uri;
             if (uri && !cancelled) {
               await uploadRecording(uri);
             }
@@ -484,6 +511,70 @@ export default function Home() {
         )}
       </Card>
 
+      {/* ─── INDIA-WIDE SAFEST ROUTE SYSTEM ─── */}
+      <Card>
+        <View style={styles.spaceBetween}>
+          <Text style={styles.h2}>🧭 India-Wide Safest Route</Text>
+          <Badge label="DATA-DRIVEN" variant="success" />
+        </View>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          Compare alternative routes between any two points in India using live lighting coverage,
+          police outpost density, medical emergency havens, and NCRB crime statistics.
+        </Text>
+        <Action
+          label="🔍 Find Safest Route Across India"
+          onPress={() => router.push("/safest-route" as never)}
+        />
+      </Card>
+
+      {/* ─── LIVE MAP & NEARBY POLICE STATIONS ─── */}
+      <Card>
+        <View style={styles.spaceBetween}>
+          <Text style={styles.h2}>🗺️ Live Map & Police Stations</Text>
+          <Badge
+            label={userCoords ? "GPS ACTIVE" : "RADAR"}
+            variant={userCoords ? "success" : "neutral"}
+          />
+        </View>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          {nearbyStations.length > 0
+            ? `Nearest: ${nearbyStations[0].name} (${nearbyStations[0].distanceKm ?? 0.8} km away). Track your live position, compass, and nearest police stations.`
+            : "Locate nearby police outposts and track your live GPS position on an interactive radar map."}
+        </Text>
+
+        <Action
+          label={showMap ? "Hide Radar Map" : "🗺️ View Live Radar Map & Stations"}
+          secondary
+          onPress={() => setShowMap((prev) => !prev)}
+        />
+
+        {showMap && (
+          <View style={{ marginTop: 12 }}>
+            <LiveMapView
+              userLocation={userCoords}
+              policeStations={nearbyStations}
+              onRefresh={loadNearbyStations}
+            />
+          </View>
+        )}
+      </Card>
+
+      {/* ─── CONFIDENTIAL CRIME REPORTING TO POLICE ─── */}
+      <Card>
+        <View style={styles.spaceBetween}>
+          <Text style={styles.h2}>🛡️ Report Crime to Police</Text>
+          <Badge label="POLICE ONLY" variant="warning" />
+        </View>
+        <Text style={[styles.subtitle, { marginTop: 6 }]}>
+          Privately transmit photo evidence, scene GPS coordinates, and incident details directly to
+          the Police Dashboard. Strictly confidential — NOT shared with your contacts.
+        </Text>
+        <Action
+          label="📸 Report Crime with Photo Proof"
+          onPress={() => router.push("/report-crime" as never)}
+        />
+      </Card>
+
       {/* Planned journey */}
       <Card>
         <Text style={styles.h2}>Going somewhere?</Text>
@@ -504,12 +595,13 @@ export default function Home() {
       </Card>
 
       <Card>
-        <Text style={styles.h2}>Taking a cab?</Text>
+        <Text style={styles.h2}>Walk With Me</Text>
         <Text style={[styles.subtitle, { marginTop: 6 }]}>
-          Share your driver name, vehicle plate, trip reference, destination, and current map pin with trusted contacts.
+          Real-time GPS route tracking. Get automatic alerts to contacts if you deviate from your path
+          or stop unexpectedly for more than 3 minutes.
         </Text>
         <Action
-          label="Share cab details"
+          label="Start a walk"
           secondary
           onPress={() => router.push("/ride" as never)}
         />
