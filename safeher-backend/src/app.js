@@ -9,7 +9,6 @@ const contacts = require("./routes/contacts");
 const police = require("./routes/police");
 const notify = require("./routes/notify");
 const users = require("./routes/users");
-const walksafe = require("./routes/walksafe");
 const safeRoute = require("./routes/safeRoute");
 const { notFound, errorHandler } = require("./middleware/errors");
 const { isConfigured } = require("./db/supabase");
@@ -19,12 +18,17 @@ const app = express();
 /* ─── Security + parsing ─────────────────────────────────── */
 app.use(helmet());
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
-app.use(express.json({ limit: "100kb" }));
+// Evidence uploads may arrive as base64 JSON from phones, so they get a larger body limit.
+const evidenceUploadPath = /^\/api\/emergencies\/[^/]+\/(audio|photos)$/;
+const smallJson = express.json({ limit: "100kb" });
+const evidenceJson = express.json({ limit: "15mb" });
+app.use((req, res, next) => (evidenceUploadPath.test(req.path) ? evidenceJson : smallJson)(req, res, next));
 app.use(morgan("combined"));
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 400,
+    // An active SOS sends location every few seconds and dashboards poll every 15s.
+    limit: 3000,
     standardHeaders: true,
     legacyHeaders: false,
   })
@@ -60,7 +64,6 @@ app.use("/api/family", contacts);    // /api/family/emergencies alias
 app.use("/api/police", police);
 app.use("/api/notify", notify);
 app.use("/api/users", users);
-app.use("/api/walksafe", walksafe);
 app.use("/api/routes", safeRoute);
 app.use("/api/safety", safeRoute);
 

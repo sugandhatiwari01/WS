@@ -21,20 +21,33 @@ export type EvaluatedRoute = {
   routeId: string;
   distance: number; // metres
   duration: number; // seconds
-  safetyScore: number; // 0 - 100
-  dataCoverage: number; // 0 - 100%
+  /** 0–100, or null when no safety data could be fetched for this route. */
+  safetyScore: number | null;
+  /** Share (0–100%) of the full score backed by real data for this route. */
+  dataCoverage: number;
   isRecommended?: boolean;
+  isFastest?: boolean;
+  viaWaypoint?: boolean;
   geometry: RouteGeometry;
   legs?: { summary?: string }[];
+  /** null = no data for that factor (never a guess). */
   indicators: {
-    streetlightCoverage: number;
-    policeProximity: number;
-    crimeSafetyIndex: number;
-    populationActivity: number;
-    cctvAvailability: number;
-    closestPoliceDistM?: number;
+    policeProximity: number | null;
+    helpPointsCoverage: number | null;
+    streetlightCoverage: number | null;
+    lightingKnownPct: number | null;
+    routeCheckedPct: number;
+    communityReports: number;
+    closestPoliceDistM: number | null;
+    farthestFromPoliceM: number | null;
+    /** Share of the checked route more than 3 km from any police station. */
+    beyondPolice3kmPct: number | null;
   };
 };
+
+/** Badge colour for a score (null = no data). */
+export const scoreVariant = (score: number | null) =>
+  score == null ? "neutral" : score >= 65 ? "success" : score >= 45 ? "warning" : "danger";
 
 type RouteMapViewProps = {
   routes: EvaluatedRoute[];
@@ -109,13 +122,13 @@ export default function RouteMapView({
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>🗺️ Multi-Corridor Safety Map</Text>
           <Text style={styles.subtitle}>
-            Comparing {routes.length} candidate paths by illumination, police & crime index
+            Comparing {routes.length} real route{routes.length === 1 ? "" : "s"} by police reach, help points and lighting
           </Text>
         </View>
         {activeRoute && (
           <Badge
-            label={`${activeRoute.safetyScore}/100 SAFE`}
-            variant={activeRoute.safetyScore >= 65 ? "success" : activeRoute.safetyScore >= 45 ? "warning" : "danger"}
+            label={activeRoute.safetyScore == null ? "NO DATA" : `${activeRoute.safetyScore}/100`}
+            variant={scoreVariant(activeRoute.safetyScore)}
           />
         )}
       </View>
@@ -185,7 +198,7 @@ export default function RouteMapView({
               <G key={`${marker.name}-${idx}`}>
                 <Circle cx={x} cy={y} r="6" fill={isPolice ? "#3B82F6" : isHospital ? "#EF4444" : "#F59E0B"} stroke="#FFFFFF" strokeWidth="1" />
                 <SvgText x={x} y={y - 8} fill="#E2E8F0" fontSize="8" fontWeight="600" textAnchor="middle">
-                  {isPolice ? "👮" : isHospital ? "🏥" : "💡"}
+                  {isPolice ? "👮" : isHospital ? "🏥" : "🚉"}
                 </SvgText>
               </G>
             );

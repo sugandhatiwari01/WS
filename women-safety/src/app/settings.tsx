@@ -19,6 +19,7 @@ import { useSos } from "@/hooks/useSos";
 import { post } from "@/lib/api";
 import FakeCallModal from "@/components/fake-call-modal";
 import { colors, styles } from "@/lib/theme";
+import { INDIA_HELPLINES } from "@/lib/helplines";
 
 export default function Settings() {
   const { user, signOut } = useAuth();
@@ -116,10 +117,15 @@ export default function Settings() {
         <Text style={styles.h3}>📞 Emergency services</Text>
         <Text style={[styles.subtitle, { marginTop: 6 }]}>Quick-dial in an emergency.</Text>
         <Divider />
-        <Action label="Call 112 — Emergency" danger onPress={() => openUrl("tel:112")} />
-        <Action label="Call 100 — Police" secondary onPress={() => openUrl("tel:100")} />
-        <Action label="Call 108 — Ambulance" secondary onPress={() => openUrl("tel:108")} />
-        <Action label="Call 1091 — Women helpline" secondary onPress={() => openUrl("tel:1091")} />
+        {INDIA_HELPLINES.map((h) => (
+          <Action
+            key={h.number}
+            label={`Call ${h.number} — ${h.label}`}
+            danger={h.number === "112"}
+            secondary={h.number !== "112"}
+            onPress={() => openUrl(`tel:${h.number}`)}
+          />
+        ))}
       </Card>
 
       {/* Fake call */}

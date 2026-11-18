@@ -7,7 +7,7 @@
 
 import { router } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Linking, ScrollView, Text, View } from "react-native";
+import { Linking, ScrollView, Text, View } from "react-native";
 import { Action, Badge, Card, Divider, EmptyState, Header, StatusBanner } from "@/components/ui";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -19,22 +19,9 @@ type Emergency = {
   emergencyId?: string;
   status?: string;
   createdAt?: string;
-  currentLocation?: { latitude?: number; longitude?: number } | null;
+  currentLocation?: { latitude?: number; longitude?: number; timestamp?: string } | null;
   initialLocation?: { latitude?: number; longitude?: number } | null;
   userId?: string;
-};
-
-type WalkAlert = {
-  id: string;
-  kind: "deviation" | "stopped" | "started";
-  sessionId: string;
-  userName?: string;
-  destinationName?: string;
-  latitude?: number;
-  longitude?: number;
-  deviationMetres?: number;
-  stoppedForSeconds?: number;
-  timestamp: string;
 };
 
 function statusVariant(status?: string): "danger" | "warning" | "success" | "neutral" {
@@ -64,7 +51,6 @@ function getMapUrl(emergency: Emergency): string | null {
 export default function FamilyScreen() {
   const { user } = useAuth();
   const [emergencies, setEmergencies] = useState<Emergency[]>([]);
-  const [walkAlerts, setWalkAlerts] = useState<WalkAlert[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -90,31 +76,16 @@ export default function FamilyScreen() {
           return [item, ...prev];
         });
       } else if (event === "location:live") {
-        const loc = data as { emergencyId: string; latitude: number; longitude: number };
+        const loc = data as { emergencyId: string; latitude: number; longitude: number; timestamp?: string };
         setEmergencies((prev) =>
           prev.map((e) =>
             e._id === loc.emergencyId || e.emergencyId === loc.emergencyId
-              ? { ...e, currentLocation: { latitude: loc.latitude, longitude: loc.longitude } }
+              ? { ...e, currentLocation: { latitude: loc.latitude, longitude: loc.longitude, timestamp: loc.timestamp } }
               : e
           )
         );
-      } else if (event === "audio:evidence" || event === "family:ride") {
+      } else if (event === "audio:evidence" || event === "photo:evidence" || event === "family:ride") {
         void load();
-      } else if (event === "walksafe:deviation") {
-        const d = data as { sessionId: string; userName?: string; destinationName?: string; latitude?: number; longitude?: number; deviationMetres?: number };
-        setWalkAlerts((prev) => [
-          { id: `dev-${d.sessionId}-${Date.now()}`, kind: "deviation", sessionId: d.sessionId, userName: d.userName, destinationName: d.destinationName, latitude: d.latitude, longitude: d.longitude, deviationMetres: d.deviationMetres, timestamp: new Date().toISOString() },
-          ...prev.slice(0, 9),
-        ]);
-      } else if (event === "walksafe:stopped") {
-        const d = data as { sessionId: string; userName?: string; destinationName?: string; latitude?: number; longitude?: number; stoppedForSeconds?: number };
-        setWalkAlerts((prev) => [
-          { id: `stp-${d.sessionId}-${Date.now()}`, kind: "stopped", sessionId: d.sessionId, userName: d.userName, destinationName: d.destinationName, latitude: d.latitude, longitude: d.longitude, stoppedForSeconds: d.stoppedForSeconds, timestamp: new Date().toISOString() },
-          ...prev.slice(0, 9),
-        ]);
-      } else if (event === "walksafe:arrived" || event === "walksafe:cancelled") {
-        const d = data as { sessionId: string };
-        setWalkAlerts((prev) => prev.filter((a) => a.sessionId !== d.sessionId));
       }
     },
   });
@@ -143,35 +114,6 @@ export default function FamilyScreen() {
         />
       )}
 
-      {/* Walk With Me alerts */}
-      {walkAlerts.length > 0 && (
-        <Card danger>
-          <Text style={[styles.h2, { color: colors.red }]}>🚶 Walk Safety Alerts</Text>
-          {walkAlerts.map((alert) => (
-            <View key={alert.id} style={{ marginTop: 10, padding: 10, backgroundColor: colors.border, borderRadius: 8 }}>
-              <Text style={{ fontWeight: "700" }}>
-                {alert.kind === "deviation" ? "⚠️ Off Route" : "⚠️ Stopped"} — {alert.userName ?? "Contact"}
-              </Text>
-              <Text style={[styles.caption, { marginTop: 2 }]}>
-                Walking to: {alert.destinationName ?? "unknown"}
-              </Text>
-              {alert.kind === "deviation" && alert.deviationMetres ? (
-                <Text style={styles.caption}>Deviated {alert.deviationMetres} m from route</Text>
-              ) : null}
-              {alert.kind === "stopped" && alert.stoppedForSeconds ? (
-                <Text style={styles.caption}>Stopped for {alert.stoppedForSeconds} seconds</Text>
-              ) : null}
-              {alert.latitude != null && alert.longitude != null ? (
-                <Action
-                  label={`📍 Last known: ${alert.latitude.toFixed(5)}, ${alert.longitude.toFixed(5)}`}
-                  secondary
-                  onPress={() => Linking.openURL(`https://maps.google.com/?q=${alert.latitude},${alert.longitude}`)}
-                />
-              ) : null}
-            </View>
-          ))}
-        </Card>
-      )}
 
       {error ? (
         <Card danger>
@@ -215,8 +157,13 @@ export default function FamilyScreen() {
                   onPress={() => Linking.openURL(mapUrl)}
                 />
               )}
+              {emergency.currentLocation?.timestamp ? (
+                <Text style={[styles.caption, { marginTop: 4 }]}>
+                  Location updated {new Date(emergency.currentLocation.timestamp).toLocaleTimeString()} · updates live while their app is open
+                </Text>
+              ) : null}
               <Action
-                label="View details & audio evidence"
+                label="📍 Live map, audio & photos"
                 secondary
                 onPress={() =>
                   router.push({

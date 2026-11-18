@@ -41,9 +41,9 @@ type Incident = {
   triggerType?: string;
   createdAt?: string;
   stationId?: string;
-  nearbyStation?: { name?: string; distanceKm?: number };
+  nearbyStation?: { name?: string; distanceKm?: number; phone?: string | null };
   initialLocation?: { latitude?: number; longitude?: number; lat?: number; lng?: number } | null;
-  currentLocation?: { latitude?: number; longitude?: number; lat?: number; lng?: number } | null;
+  currentLocation?: { latitude?: number; longitude?: number; lat?: number; lng?: number; timestamp?: string } | null;
   assignedOfficerId?: string;
 };
 
@@ -116,6 +116,9 @@ export default function PoliceDashboard() {
   const [reports, setReports] = useState<CrimeReport[]>([]);
   const [stations, setStations] = useState<PoliceStationMarker[]>([]);
   const [officerLocation, setOfficerLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [stationRadiusKm, setStationRadiusKm] = useState(10);
+  const [stationsLoading, setStationsLoading] = useState(false);
+  const [stationsError, setStationsError] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -128,7 +131,8 @@ export default function PoliceDashboard() {
   /* ─── Fetch Officer GPS ──────────────────────────────────── */
   const fetchOfficerLocation = useCallback(async () => {
     try {
-      const perm = await Location.getForegroundPermissionsAsync();
+      // Ask (the browser shows its own prompt) so the station radar can centre on the officer.
+      const perm = await Location.requestForegroundPermissionsAsync();
       if (perm.granted) {
         const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
         setOfficerLocation({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
@@ -136,14 +140,36 @@ export default function PoliceDashboard() {
     } catch (_) {}
   }, []);
 
+  /* ─── Real police stations (OpenStreetMap) around the officer ─── */
+  useEffect(() => {
+    if (!officerLocation) return;
+    let cancelled = false;
+    void (async () => {
+      setStationsLoading(true);
+      const result = await api<PoliceStationMarker[]>(
+        `/api/police/stations?latitude=${officerLocation.latitude}&longitude=${officerLocation.longitude}&radiusKm=${stationRadiusKm}`
+      );
+      if (cancelled) return;
+      if (result.data) {
+        setStations(result.data);
+        setStationsError(null);
+      } else {
+        setStationsError(result.error || "Could not look up nearby police stations.");
+      }
+      setStationsLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [officerLocation, stationRadiusKm]);
+
   /* ─── Load All Data ─────────────────────────────────────── */
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [incidentsRes, reportsRes, stationsRes] = await Promise.allSettled([
+      const [incidentsRes, reportsRes] = await Promise.allSettled([
         api<Incident[]>("/api/police/incidents"),
         api<CrimeReport[]>("/api/police/reports"),
-        api<PoliceStationMarker[]>("/api/police/stations"),
       ]);
 
       if (incidentsRes.status === "fulfilled" && incidentsRes.value.data) {
@@ -166,9 +192,6 @@ export default function PoliceDashboard() {
         setReports(data);
       }
 
-      if (stationsRes.status === "fulfilled" && stationsRes.value.data) {
-        setStations(stationsRes.value.data);
-      }
 
       setError("");
     } catch (e) {
@@ -181,18 +204,17 @@ export default function PoliceDashboard() {
   /* ─── Real-Time Socket Connection ───────────────────────── */
   useSocket({
     userId: user?._id,
-    stationId: stations[0]?.stationId,
     onEvent: (event, data) => {
       if (event === "emergency:new") {
         Vibration.vibrate([0, 500, 200, 500]);
         const item = data as Incident;
         setIncidents((prev) => (prev.some((i) => i._id === item._id) ? prev : [item, ...prev]));
       } else if (event === "location:live") {
-        const loc = data as { emergencyId: string; latitude: number; longitude: number };
+        const loc = data as { emergencyId: string; latitude: number; longitude: number; timestamp?: string };
         setIncidents((prev) =>
           prev.map((i) =>
             i._id === loc.emergencyId || i.emergencyId === loc.emergencyId
-              ? { ...i, currentLocation: { latitude: loc.latitude, longitude: loc.longitude } }
+              ? { ...i, currentLocation: { latitude: loc.latitude, longitude: loc.longitude, timestamp: loc.timestamp } }
               : i
           )
         );
@@ -207,6 +229,8 @@ export default function PoliceDashboard() {
         );
       } else if (
         event === "audio:evidence" ||
+        event === "photo:evidence" ||
+        event === "emergency:updated" ||
         event === "incident:claimed" ||
         event === "emergency:cancelled"
       ) {
@@ -398,8 +422,9 @@ export default function PoliceDashboard() {
                   {/* Nearest Station / Jurisdictional Routing */}
                   {incident.nearbyStation?.name && (
                     <Text style={[themeStyles.subtitle, { marginTop: 8 }]}>
-                      📡 Routed through: {incident.nearbyStation.name}
-                      {incident.nearbyStation.distanceKm != null ? ` (${incident.nearbyStation.distanceKm} km away)` : ""}
+                      🏢 Nearest police station: {incident.nearbyStation.name}
+                      {incident.nearbyStation.distanceKm != null ? ` (${incident.nearbyStation.distanceKm} km from the victim)` : ""}
+                      {incident.nearbyStation.phone ? ` · 📞 ${incident.nearbyStation.phone}` : ""}
                     </Text>
                   )}
 
@@ -408,6 +433,9 @@ export default function PoliceDashboard() {
                     <View style={policeStyles.locationStrip}>
                       <Text style={policeStyles.locationText}>
                         📍 Live GPS: {coords.latitude.toFixed(5)}, {coords.longitude.toFixed(5)}
+                        {incident.currentLocation?.timestamp
+                          ? ` · updated ${new Date(incident.currentLocation.timestamp).toLocaleTimeString()}`
+                          : ""}
                       </Text>
                       <TouchableOpacity
                         style={policeStyles.navMiniBtn}
@@ -435,7 +463,7 @@ export default function PoliceDashboard() {
 
                   {/* View Details & Audio Evidence */}
                   <Action
-                    label="🎙️ Review Incident & Audio Recordings"
+                    label="📍 Live Map, Audio & Photos"
                     secondary
                     onPress={() =>
                       router.push({
@@ -592,8 +620,11 @@ export default function PoliceDashboard() {
           userLocation={officerLocation}
           policeStations={stations}
           activeIncidents={mapIncidentMarkers}
-          onRefresh={loadAll}
-          loading={loading}
+          onRefresh={() => void fetchOfficerLocation()}
+          loading={stationsLoading}
+          radiusKm={stationRadiusKm}
+          onRadiusChange={setStationRadiusKm}
+          error={stationsError}
         />
       )}
 

@@ -4,9 +4,9 @@ const { body, query, validationResult } = require("express-validator");
 const { requireAuth, requireRole } = require("../middleware/auth");
 const Emergency = require("../models/Emergency");
 const EmergencyEvent = require("../models/EmergencyEvent");
-const PoliceStation = require("../models/PoliceStation");
 const CrimeReport = require("../models/CrimeReport");
 const { client } = require("../db/supabase");
+const { findNearbyPoliceStations, findNearestPoliceStation, MAX_RADIUS_KM } = require("../services/policeStations");
 
 const router = express.Router();
 const upload = multer({
@@ -23,127 +23,40 @@ const validate = (req, res, next) => {
 const findIncident = (id) => ({ $or: [{ _id: id }, { emergencyId: id }] });
 const findReport = (id) => ({ $or: [{ _id: id }, { reportId: id }] });
 
-// Haversine distance in km
-function distanceKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return Number((R * c).toFixed(2));
-}
-
 // All endpoints require valid JWT authentication
 router.use(requireAuth);
 
 /* ──────────────────────────────────────────────────────────────────────────
    1. POLICE STATIONS & NEARBY DIRECTORY (Accessible to ALL users & police)
    ────────────────────────────────────────────────────────────────────────── */
-router.get("/stations", async (req, res, next) => {
-  try {
-    const lat = req.query.latitude ? parseFloat(req.query.latitude) : null;
-    const lng = req.query.longitude ? parseFloat(req.query.longitude) : null;
-
-    let stations = await PoliceStation.find({ active: true });
-
-    // Seed default stations if only 1 or 0 exist in DB to ensure realistic coverage
-    if (!stations || stations.length < 3) {
-      const baseLat = lat || 12.9716;
-      const baseLng = lng || 77.5946;
-
-      const defaultStations = [
-        {
-          stationId: "STN-WOMEN-01",
-          name: "All-Women Police Station & Crisis Cell",
-          type: "Women Safety Special Division",
-          phone: "1091",
-          altPhone: "080-22942444",
-          address: "Police Commissionerate Complex, Women & Child Protection Wing",
-          active: true,
-          location: { type: "Point", coordinates: [baseLng + 0.008, baseLat + 0.005] },
-        },
-        {
-          stationId: "STN-CENTRAL-02",
-          name: "Central District Police Headquarters",
-          type: "District Police Station",
-          phone: "112",
-          altPhone: "080-22942222",
-          address: "Main Division Road, Law & Order Sector 1",
-          active: true,
-          location: { type: "Point", coordinates: [baseLng - 0.009, baseLat - 0.007] },
-        },
-        {
-          stationId: "STN-METRO-03",
-          name: "Transit & Metro Police Outpost",
-          type: "Rapid Transit Security Unit",
-          phone: "1512",
-          altPhone: "112",
-          address: "Central Metro Interchange Station, Concourse Level",
-          active: true,
-          location: { type: "Point", coordinates: [baseLng + 0.015, baseLat - 0.012] },
-        },
-        {
-          stationId: "STN-CYBER-04",
-          name: "Cyber Crime & Anti-Stalking Bureau",
-          type: "Specialized Cyber & Stalking Unit",
-          phone: "1930",
-          altPhone: "112",
-          address: "IT & Cyber Police Cell, Tech Park Zone",
-          active: true,
-          location: { type: "Point", coordinates: [baseLng - 0.018, baseLat + 0.016] },
-        },
-      ];
-
-      // Insert any missing ones
-      for (const ds of defaultStations) {
-        const exists = stations.some((s) => s.stationId === ds.stationId);
-        if (!exists) {
-          try {
-            const created = await PoliceStation.create(ds);
-            stations.push(created);
-          } catch (_) {
-            stations.push(ds);
-          }
-        }
-      }
+/**
+ * GET /api/police/stations?latitude=&longitude=&radiusKm=
+ * Real police stations from OpenStreetMap within radiusKm (default 10, max 22), nearest first.
+ * Phone numbers are included only when OpenStreetMap lists one — nothing is made up.
+ */
+router.get(
+  "/stations",
+  query("latitude").isFloat({ min: -90, max: 90 }).withMessage("latitude is required"),
+  query("longitude").isFloat({ min: -180, max: 180 }).withMessage("longitude is required"),
+  query("radiusKm").optional().isFloat({ min: 0.5, max: MAX_RADIUS_KM }),
+  validate,
+  async (req, res, next) => {
+    try {
+      const { stations, provider, radiusKm, coveredKm } = await findNearbyPoliceStations(
+        Number(req.query.latitude),
+        Number(req.query.longitude),
+        req.query.radiusKm ? Number(req.query.radiusKm) : 10
+      );
+      res.set("X-Station-Source", `openstreetmap-${provider}`);
+      res.set("X-Station-Radius-Km", String(radiusKm));
+      res.set("X-Station-Covered-Km", String(coveredKm));
+      res.json(stations);
+    } catch (e) {
+      if (e.status === 503) return res.status(503).json({ error: e.message });
+      next(e);
     }
-
-    // Compute distance from provided coordinates
-    const formatted = stations.map((s) => {
-      const coords = s.location?.coordinates || [77.5946, 12.9716];
-      const stationLng = coords[0];
-      const stationLat = coords[1];
-      const dist =
-        lat != null && lng != null ? distanceKm(lat, lng, stationLat, stationLng) : null;
-
-      return {
-        _id: s._id,
-        stationId: s.stationId || s._id,
-        name: s.name,
-        type: s.type || "Police Station",
-        phone: s.phone || "112",
-        altPhone: s.altPhone || null,
-        address: s.address || "Police Station Jurisdiction",
-        distanceKm: dist,
-        latitude: stationLat,
-        longitude: stationLng,
-      };
-    });
-
-    if (lat != null && lng != null) {
-      formatted.sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999));
-    }
-
-    res.json(formatted);
-  } catch (e) {
-    next(e);
   }
-});
+);
 
 /* ──────────────────────────────────────────────────────────────────────────
    2. CRIME REPORTING (CONFIDENTIAL IN-APP REPORTING DIRECT TO POLICE)
@@ -212,22 +125,11 @@ router.post(
       const lng = req.body.longitude != null ? parseFloat(req.body.longitude) : null;
 
       // Find nearest station
+      // Nearest real (OpenStreetMap) police station within 20 km, if one is listed.
       let nearestStation = null;
       if (lat != null && lng != null) {
-        const stations = await PoliceStation.find({ active: true });
-        if (stations && stations.length > 0) {
-          const sorted = stations
-            .map((s) => {
-              const coords = s.location?.coordinates || [0, 0];
-              return {
-                stationId: s.stationId,
-                name: s.name,
-                distance: distanceKm(lat, lng, coords[1], coords[0]),
-              };
-            })
-            .sort((a, b) => a.distance - b.distance);
-          nearestStation = sorted[0];
-        }
+        const real = await findNearestPoliceStation(lat, lng, 20);
+        if (real) nearestStation = { stationId: real.stationId, name: real.name, distance: real.distanceKm };
       }
 
       const reportData = {

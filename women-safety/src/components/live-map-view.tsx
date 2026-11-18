@@ -20,18 +20,25 @@ import Svg, {
 } from "react-native-svg";
 import { Action, Badge, Card, Divider } from "@/components/ui";
 import { colors, styles as themeStyles } from "@/lib/theme";
+import { INDIA_HELPLINES } from "@/lib/helplines";
+
+/** Radius choices for the nearby-station search (km). */
+export const STATION_RADIUS_OPTIONS = [2, 5, 10, 20];
 
 export type PoliceStationMarker = {
   _id?: string;
   stationId: string;
   name: string;
   type?: string;
-  phone?: string;
+  /** Only set when OpenStreetMap lists a number for this station. */
+  phone?: string | null;
   altPhone?: string | null;
-  address?: string;
+  address?: string | null;
   distanceKm?: number | null;
   latitude: number;
   longitude: number;
+  source?: string;
+  osmUrl?: string;
 };
 
 export type ActiveIncidentMarker = {
@@ -50,6 +57,11 @@ type LiveMapViewProps = {
   subtitle?: string;
   onRefresh?: () => void;
   loading?: boolean;
+  /** Search radius in km; the parent re-fetches stations when it changes. */
+  radiusKm?: number;
+  onRadiusChange?: (km: number) => void;
+  /** Error from the station lookup (e.g. map service unreachable). */
+  error?: string | null;
 };
 
 export default function LiveMapView({
@@ -60,14 +72,22 @@ export default function LiveMapView({
   subtitle = "Real-time location, patrol coverage, and nearest police stations.",
   onRefresh,
   loading = false,
+  radiusKm,
+  onRadiusChange,
+  error = null,
 }: LiveMapViewProps) {
-  const [selectedStation, setSelectedStation] = useState<PoliceStationMarker | null>(
-    policeStations[0] || null
-  );
-  const [rangeKm, setRangeKm] = useState<number>(10);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [localRange, setLocalRange] = useState<number>(10);
+  const [showAll, setShowAll] = useState(false);
+  const rangeKm = radiusKm ?? localRange;
+  const setRangeKm = (km: number) => (onRadiusChange ? onRadiusChange(km) : setLocalRange(km));
+  // Keep the selection valid when the list changes (new radius or position).
+  const selectedStation = policeStations.find((s) => s.stationId === selectedId) ?? policeStations[0] ?? null;
+  const setSelectedStation = (s: PoliceStationMarker) => setSelectedId(s.stationId);
+  const listed = showAll ? policeStations : policeStations.slice(0, 5);
 
-  const centerLat = userLocation?.latitude ?? 12.9716;
-  const centerLng = userLocation?.longitude ?? 77.5946;
+  const centerLat = userLocation?.latitude ?? 0;
+  const centerLng = userLocation?.longitude ?? 0;
 
   // Radar Canvas Size
   const canvasSize = 320;
@@ -137,8 +157,8 @@ export default function LiveMapView({
 
       {/* Range Filter Controls */}
       <View style={mapStyles.rangeContainer}>
-        <Text style={[themeStyles.caption, { fontWeight: "700", marginRight: 8 }]}>Radar Radius:</Text>
-        {[5, 10, 20].map((r) => (
+        <Text style={[themeStyles.caption, { fontWeight: "700", marginRight: 8 }]}>Search radius:</Text>
+        {STATION_RADIUS_OPTIONS.map((r) => (
           <TouchableOpacity
             key={r}
             style={[mapStyles.rangeButton, rangeKm === r && mapStyles.rangeButtonActive]}
@@ -190,7 +210,7 @@ export default function LiveMapView({
           <Circle cx={center} cy={center} r="2.5" fill="#FFFFFF" />
 
           {/* Police Station Markers */}
-          {policeStations.map((station, idx) => {
+          {userLocation && policeStations.map((station, idx) => {
             const { x, y } = projectToCanvas(station.latitude, station.longitude);
             const isSelected = selectedStation?.stationId === station.stationId;
 
@@ -215,7 +235,7 @@ export default function LiveMapView({
           })}
 
           {/* Active Incidents Markers (if any) */}
-          {activeIncidents.map((inc, idx) => {
+          {userLocation && activeIncidents.map((inc, idx) => {
             const { x, y } = projectToCanvas(inc.latitude, inc.longitude);
             return (
               <G key={inc._id || idx}>
@@ -248,30 +268,50 @@ export default function LiveMapView({
         </View>
       </View>
 
+      {/* Status: no location / lookup error / nothing within radius */}
+      {!userLocation ? (
+        <Text style={[themeStyles.caption, { marginTop: 12 }]}>
+          Allow location access to find police stations near you. In an emergency, call 112.
+        </Text>
+      ) : error ? (
+        <Text style={[themeStyles.errorText, { marginTop: 12 }]}>{error}</Text>
+      ) : loading && policeStations.length === 0 ? (
+        <Text style={[themeStyles.caption, { marginTop: 12 }]}>Searching OpenStreetMap for police stations within {rangeKm} km…</Text>
+      ) : policeStations.length === 0 ? (
+        <Text style={[themeStyles.caption, { marginTop: 12 }]}>
+          No police stations are listed on OpenStreetMap within {rangeKm} km. Try a larger radius, or call 112.
+        </Text>
+      ) : null}
+
       {/* Selected Station Detail Card */}
-      {selectedStation && (
+      {userLocation && !error && selectedStation && (
         <View style={mapStyles.stationCard}>
           <View style={themeStyles.spaceBetween}>
             <View style={{ flex: 1 }}>
               <Text style={mapStyles.stationTitle}>🏢 {selectedStation.name}</Text>
-              <Text style={mapStyles.stationSubtitle}>{selectedStation.type || "Jurisdiction Outpost"}</Text>
+              <Text style={mapStyles.stationSubtitle}>{selectedStation.type || "Police station"}</Text>
             </View>
             {selectedStation.distanceKm != null && (
               <Badge
-                label={`${selectedStation.distanceKm} km`}
+                label={`${selectedStation.distanceKm.toFixed(1)} km`}
                 variant={selectedStation.distanceKm <= 3 ? "success" : "neutral"}
               />
             )}
           </View>
-          <Text style={mapStyles.stationAddress}>📍 {selectedStation.address}</Text>
+          <Text style={mapStyles.stationAddress}>📍 {selectedStation.address || "Address not listed on the map"}</Text>
+          <Text style={[themeStyles.caption, { marginTop: 4 }]}>
+            {selectedStation.phone
+              ? `Station phone (from OpenStreetMap): ${selectedStation.phone}`
+              : "This station's phone number isn't listed. Call 112 — it reaches the police anywhere in India."}
+          </Text>
 
           <View style={mapStyles.actionRow}>
             <TouchableOpacity
               style={[mapStyles.actionBtn, { backgroundColor: "#0284C7" }]}
-              onPress={() => handleCall(selectedStation.phone || selectedStation.altPhone || "112")}
+              onPress={() => handleCall(selectedStation.phone || "112")}
             >
               <Text style={mapStyles.actionBtnText}>
-                📞 Call {selectedStation.phone || "112"}
+                📞 {selectedStation.phone ? "Call station" : "Call 112"}
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
@@ -284,38 +324,62 @@ export default function LiveMapView({
         </View>
       )}
 
-      {/* Stations Quick Selector Strip */}
-      <Text style={[themeStyles.h3, { marginTop: 14, marginBottom: 6 }]}>
-        Nearby Stations ({policeStations.length})
-      </Text>
-      <View style={{ gap: 8 }}>
-        {policeStations.slice(0, 4).map((s) => {
-          const isSelected = selectedStation?.stationId === s.stationId;
-          return (
-            <TouchableOpacity
-              key={s.stationId}
-              style={[mapStyles.stationListItem, isSelected && mapStyles.stationListItemActive]}
-              onPress={() => setSelectedStation(s)}
-            >
-              <View style={{ flex: 1 }}>
-                <Text style={[mapStyles.listName, isSelected && { color: colors.primary }]}>
-                  {s.name}
-                </Text>
-                <Text style={themeStyles.caption} numberOfLines={1}>
-                  {s.address}
-                </Text>
-              </View>
-              <View style={{ alignItems: "flex-end" }}>
-                <Text style={[themeStyles.caption, { fontWeight: "700" }]}>
-                  {s.distanceKm != null ? `${s.distanceKm} km` : "Nearby"}
-                </Text>
-                <Text style={[themeStyles.caption, { color: colors.muted }]}>
-                  {s.phone || "112"}
-                </Text>
-              </View>
+      {/* Stations list */}
+      {userLocation && !error && policeStations.length > 0 && (
+        <>
+          <Text style={[themeStyles.h3, { marginTop: 14, marginBottom: 6 }]}>
+            {policeStations.length} police station{policeStations.length === 1 ? "" : "s"} within {rangeKm} km
+          </Text>
+          <View style={{ gap: 8 }}>
+            {listed.map((s) => {
+              const isSelected = selectedStation?.stationId === s.stationId;
+              return (
+                <TouchableOpacity
+                  key={s.stationId}
+                  style={[mapStyles.stationListItem, isSelected && mapStyles.stationListItemActive]}
+                  onPress={() => setSelectedStation(s)}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={[mapStyles.listName, isSelected && { color: colors.primary }]}>{s.name}</Text>
+                    <Text style={themeStyles.caption} numberOfLines={1}>
+                      {s.type || "Police station"}{s.address ? ` · ${s.address}` : ""}
+                    </Text>
+                  </View>
+                  <View style={{ alignItems: "flex-end" }}>
+                    <Text style={[themeStyles.caption, { fontWeight: "700" }]}>
+                      {s.distanceKm != null ? `${s.distanceKm.toFixed(1)} km` : ""}
+                    </Text>
+                    <Text style={[themeStyles.caption, { color: colors.muted }]}>{s.phone || "No phone listed"}</Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          {policeStations.length > 5 && (
+            <TouchableOpacity onPress={() => setShowAll((v) => !v)} style={{ marginTop: 8 }}>
+              <Text style={{ color: colors.primary, fontWeight: "700" }}>
+                {showAll ? "Show fewer" : `Show all ${policeStations.length}`}
+              </Text>
             </TouchableOpacity>
-          );
-        })}
+          )}
+          <Text style={[themeStyles.caption, { marginTop: 8 }]}>
+            Station data © OpenStreetMap contributors. Small posts may be missing — if unsure, call 112.
+          </Text>
+        </>
+      )}
+
+      {/* Official helplines */}
+      <Text style={[themeStyles.h3, { marginTop: 16, marginBottom: 6 }]}>Official helplines (India)</Text>
+      <View style={{ gap: 6 }}>
+        {INDIA_HELPLINES.map((h) => (
+          <TouchableOpacity key={h.number} style={mapStyles.stationListItem} onPress={() => handleCall(h.number)}>
+            <View style={{ flex: 1 }}>
+              <Text style={mapStyles.listName}>{h.label}</Text>
+              <Text style={themeStyles.caption} numberOfLines={1}>{h.detail}</Text>
+            </View>
+            <Text style={[mapStyles.listName, { color: colors.primary }]}>📞 {h.number}</Text>
+          </TouchableOpacity>
+        ))}
       </View>
 
       <Divider />
@@ -331,7 +395,7 @@ export default function LiveMapView({
         {onRefresh && (
           <View style={{ flex: 1 }}>
             <Action
-              label={loading ? "Refreshing…" : "🔄 Refresh GPS"}
+              label={loading ? "Refreshing…" : "🔄 Refresh stations"}
               secondary
               loading={loading}
               onPress={onRefresh}

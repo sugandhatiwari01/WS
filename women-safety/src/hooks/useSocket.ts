@@ -12,7 +12,7 @@
 import { useEffect, useRef, useCallback } from "react";
 import { getToken } from "@/lib/api";
 
-const API_URL = (process.env.EXPO_PUBLIC_API_URL || "").replace(/\/$/, "");
+import { API_URL } from "@/lib/api-url";
 
 type Handler = (data: unknown) => void;
 
@@ -71,16 +71,12 @@ export function useSocket({
       "emergency:new",
       "emergency:cancelled",
       "emergency:escalated",
+      "emergency:updated",
       "incident:claimed",
       "location:update",
       "location:live",
       "audio:evidence",
-      "walksafe:started",
-      "walksafe:location",
-      "walksafe:deviation",
-      "walksafe:stopped",
-      "walksafe:arrived",
-      "walksafe:cancelled",
+      "photo:evidence",
       "crime:new",
       "crime:updated",
       "connect",

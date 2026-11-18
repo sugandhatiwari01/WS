@@ -1,19 +1,15 @@
 /**
- * India-Wide Safest Route Navigation Screen — Universal Edition
+ * Safest Route — any start and destination in India.
  *
- * Capabilities:
- * - Enter ANY starting location in India (editable text or 1-tap live GPS)
- * - Enter ANY destination anywhere in India (by place name, city, landmark, or coordinates)
- * - Live Pan-India Autocomplete powered by Photon OpenStreetMap & India Directory
- * - Automatically resolves and geocodes any typed text on the fly
- * - Multi-corridor OSRM alternative route generation across all Indian States & UTs
- * - Comprehensive safety evaluation (Illumination, Police Posts, NCRB Risk Index, Transit Hubs)
- * - Interactive multi-route visual map with infrastructure pins
- * - Real-time turn-by-turn navigation simulation mode
- * - Community safety concern reporting
+ * - Start from GPS or any typed place; search any city, town, village, area or landmark in India
+ * - Walking or driving routes from OpenStreetMap (real roads, with genuine alternatives)
+ * - Each route scored on real open data: police reach, nearby help points (police, hospitals,
+ *   transit) and street lighting where mapped, minus SafeHer community hazard reports
+ * - Factors without data show "No data" — nothing is invented
+ * - Opens the chosen route in Google Maps for turn-by-turn directions
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -28,7 +24,7 @@ import {
 import { router } from "expo-router";
 import * as Location from "expo-location";
 import { Action, Badge, Card, Divider, Header } from "@/components/ui";
-import RouteMapView, { EvaluatedRoute } from "@/components/route-map-view";
+import RouteMapView, { EvaluatedRoute, scoreVariant } from "@/components/route-map-view";
 import { api, post } from "@/lib/api";
 import { colors, styles as themeStyles } from "@/lib/theme";
 
@@ -38,8 +34,8 @@ type PlaceResult = {
   displayName: string;
   latitude: number;
   longitude: number;
-  state?: string;
-  city?: string;
+  state?: string | null;
+  city?: string | null;
 };
 
 type SafetyFacility = {
@@ -49,209 +45,155 @@ type SafetyFacility = {
   longitude: number;
 };
 
-export default function SafestRouteScreen() {
-  // Navigation & Origin/Dest State
-  const [originCoords, setOriginCoords] = useState<{ latitude: number; longitude: number } | null>(null);
-  const [originText, setOriginText] = useState("Current GPS Location");
-  const [destinationText, setDestinationText] = useState("");
-  const [destinationCoords, setDestinationCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+type Coords = { latitude: number; longitude: number };
+type TravelMode = "walking" | "driving";
 
-  // Search Results State
+type SafestResponse = {
+  ok: boolean;
+  origin: Coords;
+  destination: Coords;
+  recommendedRouteId: string;
+  routes: EvaluatedRoute[];
+  facilities: SafetyFacility[];
+  metadata: { disclaimer: string; dataSources: string[]; lightingAvailable: boolean; placeProvider: string };
+};
+
+const pct = (v: number | null | undefined) => (v == null ? "No data" : `${v}%`);
+const km = (m: number | null | undefined) => (m == null ? "—" : m < 1000 ? `${m} m` : `${(m / 1000).toFixed(1)} km`);
+
+export default function SafestRouteScreen() {
+  const [originCoords, setOriginCoords] = useState<Coords | null>(null);
+  const [originText, setOriginText] = useState("");
+  const [destinationText, setDestinationText] = useState("");
+  const [destinationCoords, setDestinationCoords] = useState<Coords | null>(null);
+  const [mode, setMode] = useState<TravelMode>("walking");
+
   const [activeSearchField, setActiveSearchField] = useState<"origin" | "dest" | null>(null);
   const [originSuggestions, setOriginSuggestions] = useState<PlaceResult[]>([]);
   const [destSuggestions, setDestSuggestions] = useState<PlaceResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const searchSeq = useRef(0);
 
-  // Route & Safety Evaluation State
   const [routes, setRoutes] = useState<EvaluatedRoute[]>([]);
   const [selectedRouteId, setSelectedRouteId] = useState<string>("");
   const [safetyMarkers, setSafetyMarkers] = useState<SafetyFacility[]>([]);
   const [evaluating, setEvaluating] = useState(false);
-  const [evaluationMeta, setEvaluationMeta] = useState<string>("");
+  const [meta, setMeta] = useState<SafestResponse["metadata"] | null>(null);
 
-  // Navigation Mode State
-  const [isNavigating, setIsNavigating] = useState(false);
-  const [remainingDistM, setRemainingDistM] = useState(0);
-  const [remainingSec, setRemainingSec] = useState(0);
-
-  // Safety Reporting State
   const [showReportCard, setShowReportCard] = useState(false);
   const [reportCategory, setReportCategory] = useState("poor_lighting");
   const [reportDesc, setReportDesc] = useState("");
   const [submittingReport, setSubmittingReport] = useState(false);
 
-  // 1. Detect Current GPS Location
+  // 1. Current GPS location as the default start
   const detectLocation = useCallback(async () => {
     try {
       const perm = await Location.requestForegroundPermissionsAsync();
       if (!perm.granted) {
-        Alert.alert("GPS permission required", "Please allow GPS location access to detect your current position.");
+        setOriginText("");
+        Alert.alert("Location is off", "Allow location access, or type where you are starting from.");
         return;
       }
       const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       setOriginCoords({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
-      setOriginText(`My GPS (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
+      setOriginText("My current location");
     } catch (_) {
-      setOriginCoords({ latitude: 12.9716, longitude: 77.5946 });
-      setOriginText("Bengaluru Central (MG Road)");
+      setOriginCoords(null);
+      setOriginText("");
+      Alert.alert("Location unavailable", "Could not get your GPS position. Type where you are starting from.");
     }
   }, []);
 
   useEffect(() => {
-    void detectLocation();
+    void Promise.resolve().then(detectLocation);
   }, [detectLocation]);
 
-  // 2. Pan-India Place Search (for both Origin and Destination)
-  const searchOriginPlaces = async (text: string) => {
-    setOriginText(text);
-    setOriginCoords(null); // Will re-resolve
-    setActiveSearchField("origin");
+  // 2. Place search anywhere in India (results near the start are preferred)
+  const searchPlaces = async (text: string, field: "origin" | "dest") => {
+    if (field === "origin") {
+      setOriginText(text);
+      setOriginCoords(null);
+    } else {
+      setDestinationText(text);
+      setDestinationCoords(null);
+    }
+    setActiveSearchField(field);
+    const setList = field === "origin" ? setOriginSuggestions : setDestSuggestions;
     if (text.trim().length < 2) {
+      setList([]);
+      return;
+    }
+    const seq = ++searchSeq.current;
+    setSearching(true);
+    try {
+      const near = field === "dest" && originCoords ? `&nearLat=${originCoords.latitude}&nearLng=${originCoords.longitude}` : "";
+      const res = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(text.trim())}${near}`);
+      if (seq === searchSeq.current && res.data) setList(res.data); // ignore out-of-order replies
+    } finally {
+      if (seq === searchSeq.current) setSearching(false);
+    }
+  };
+
+  const selectPlace = (place: PlaceResult, field: "origin" | "dest") => {
+    const coords = { latitude: place.latitude, longitude: place.longitude };
+    if (field === "origin") {
+      setOriginCoords(coords);
+      setOriginText(place.name);
       setOriginSuggestions([]);
-      return;
-    }
-    setSearching(true);
-    try {
-      const res = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(text.trim())}`);
-      if (res.data) setOriginSuggestions(res.data);
-    } catch (_) {
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  const searchDestPlaces = async (text: string) => {
-    setDestinationText(text);
-    setDestinationCoords(null); // Will re-resolve
-    setActiveSearchField("dest");
-    if (text.trim().length < 2) {
+    } else {
+      setDestinationCoords(coords);
+      setDestinationText(place.name);
       setDestSuggestions([]);
-      return;
     }
-    setSearching(true);
-    try {
-      const res = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(text.trim())}`);
-      if (res.data) setDestSuggestions(res.data);
-    } catch (_) {
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  const selectOrigin = (place: PlaceResult) => {
-    setOriginCoords({ latitude: place.latitude, longitude: place.longitude });
-    setOriginText(place.name || place.displayName.split(",")[0]);
-    setOriginSuggestions([]);
     setActiveSearchField(null);
   };
 
-  const selectDestination = (place: PlaceResult) => {
-    setDestinationCoords({ latitude: place.latitude, longitude: place.longitude });
-    setDestinationText(place.name || place.displayName.split(",")[0]);
-    setDestSuggestions([]);
-    setActiveSearchField(null);
+  /** Coordinates for a field: already chosen, typed as "lat, lng", or the top search result. */
+  const resolve = async (coords: Coords | null, text: string, near?: Coords | null): Promise<Coords | null> => {
+    if (coords) return coords;
+    const t = text.trim();
+    if (!t) return null;
+    const nearQs = near ? `&nearLat=${near.latitude}&nearLng=${near.longitude}` : "";
+    const found = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(t)}${nearQs}`);
+    const top = found.data?.[0];
+    return top ? { latitude: top.latitude, longitude: top.longitude } : null;
   };
 
-  // Helper to parse coordinate strings like "18.52, 73.85"
-  const parseCoordinates = (str: string): { latitude: number; longitude: number } | null => {
-    const match = str.trim().match(/^(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)$/);
-    if (match) {
-      const lat = parseFloat(match[1]);
-      const lng = parseFloat(match[3]);
-      if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
-        return { latitude: lat, longitude: lng };
-      }
-    }
-    return null;
-  };
-
-  // 3. Find & Score Safest Routes
-  const findSafestRoutes = async (destLatParam?: number, destLngParam?: number) => {
+  // 3. Find and score routes
+  const findSafestRoutes = async () => {
     setOriginSuggestions([]);
     setDestSuggestions([]);
     setActiveSearchField(null);
-
-    // Resolve Origin coordinates if not set
-    let resolvedOrigin = originCoords;
-    if (!resolvedOrigin && originText.trim()) {
-      const parsed = parseCoordinates(originText);
-      if (parsed) {
-        resolvedOrigin = parsed;
-        setOriginCoords(parsed);
-      } else {
-        const found = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(originText.trim())}`);
-        if (found.data && found.data.length > 0) {
-          resolvedOrigin = { latitude: found.data[0].latitude, longitude: found.data[0].longitude };
-          setOriginCoords(resolvedOrigin);
-        }
-      }
-    }
-
-    if (!resolvedOrigin) {
-      resolvedOrigin = { latitude: 12.9716, longitude: 77.5946 };
-      setOriginCoords(resolvedOrigin);
-    }
-
-    // Resolve Destination coordinates if not set
-    let resolvedDest = destLatParam && destLngParam ? { latitude: destLatParam, longitude: destLngParam } : destinationCoords;
-
-    if (!resolvedDest && destinationText.trim()) {
-      const parsed = parseCoordinates(destinationText);
-      if (parsed) {
-        resolvedDest = parsed;
-        setDestinationCoords(parsed);
-      } else {
-        setEvaluating(true);
-        const found = await api<PlaceResult[]>(`/api/safety/places?q=${encodeURIComponent(destinationText.trim())}`);
-        if (found.data && found.data.length > 0) {
-          resolvedDest = { latitude: found.data[0].latitude, longitude: found.data[0].longitude };
-          setDestinationCoords(resolvedDest);
-          setDestinationText(found.data[0].name || destinationText);
-        }
-      }
-    }
-
-    if (!resolvedDest) {
-      Alert.alert("Destination needed", "Enter any city, town, road, or address in India.");
-      setEvaluating(false);
-      return;
-    }
-
     setEvaluating(true);
-    setRoutes([]);
     try {
-      const payload = {
-        originLat: resolvedOrigin.latitude,
-        originLng: resolvedOrigin.longitude,
-        destLat: resolvedDest.latitude,
-        destLng: resolvedDest.longitude,
-        origin: originText,
-        destination: destinationText,
-      };
-
-      const res = await post<{
-        ok: boolean;
-        recommendedRouteId: string;
-        routes: EvaluatedRoute[];
-        metadata: { disclaimer: string; evaluatedAt: string };
-      }>("/api/routes/safest", payload);
-
-      if (res.error || !res.data?.routes || res.data.routes.length === 0) {
-        Alert.alert("Routing failed", res.error || "Could not calculate routes for this corridor.");
+      const origin = await resolve(originCoords, originText);
+      if (!origin) {
+        Alert.alert("Starting point needed", "Use GPS or type where you are starting from in India.");
         return;
       }
-
+      setOriginCoords(origin);
+      const dest = await resolve(destinationCoords, destinationText, origin);
+      if (!dest) {
+        Alert.alert("Destination not found", "Try a more specific place name in India, e.g. area and city.");
+        return;
+      }
+      setDestinationCoords(dest);
+      setRoutes([]);
+      const res = await post<SafestResponse>("/api/routes/safest", {
+        originLat: origin.latitude,
+        originLng: origin.longitude,
+        destLat: dest.latitude,
+        destLng: dest.longitude,
+        mode,
+      });
+      if (res.error || !res.data?.routes?.length) {
+        Alert.alert("No routes", res.error || "Could not calculate routes between these places.");
+        return;
+      }
       setRoutes(res.data.routes);
       setSelectedRouteId(res.data.recommendedRouteId || res.data.routes[0].routeId);
-      setEvaluationMeta(res.data.metadata?.disclaimer || "");
-
-      // Query nearby corridor safety facilities for visualization
-      const midLat = (resolvedOrigin.latitude + resolvedDest.latitude) / 2;
-      const midLng = (resolvedOrigin.longitude + resolvedDest.longitude) / 2;
-      const facsRes = await api<SafetyFacility[]>(`/api/safety/nearby?latitude=${midLat}&longitude=${midLng}&radiusM=15000`);
-      if (facsRes.data) {
-        setSafetyMarkers(facsRes.data.slice(0, 15));
-      }
+      setSafetyMarkers(res.data.facilities || []);
+      setMeta(res.data.metadata);
     } catch (err) {
       Alert.alert("Error", err instanceof Error ? err.message : "Route calculation failed.");
     } finally {
@@ -259,37 +201,40 @@ export default function SafestRouteScreen() {
     }
   };
 
-  // Start Navigation Simulation
-  const startNavigation = () => {
-    const selected = routes.find((r) => r.routeId === selectedRouteId) || routes[0];
-    if (!selected) return;
-
-    setIsNavigating(true);
-    setRemainingDistM(selected.distance);
-    setRemainingSec(selected.duration);
-    Alert.alert(
-      "Safest Navigation Active",
-      `Navigating along the safest corridor (${selected.safetyScore}/100 Safety Score). SafeHer is actively tracking lighting, police proximity, and route deviations.`
-    );
+  // Turn-by-turn directions in Google Maps along the chosen road(s)
+  const openInMaps = (route: EvaluatedRoute) => {
+    if (!originCoords || !destinationCoords) return;
+    const coords = route.geometry.coordinates;
+    // Pass a midpoint of the chosen route as a waypoint so Maps follows the same corridor.
+    const mid = coords[Math.floor(coords.length / 2)];
+    const params = new URLSearchParams({
+      api: "1",
+      origin: `${originCoords.latitude},${originCoords.longitude}`,
+      destination: `${destinationCoords.latitude},${destinationCoords.longitude}`,
+      travelmode: mode === "walking" ? "walking" : "driving",
+      ...(mid ? { waypoints: `${mid[1]},${mid[0]}` } : {}),
+    });
+    void Linking.openURL(`https://www.google.com/maps/dir/?${params}`);
   };
 
-  // Submit Citizen Safety Report
+  // Community safety report at the user's current GPS position
   const submitSafetyReport = async () => {
-    const coords = originCoords || { latitude: 12.9716, longitude: 77.5946 };
     setSubmittingReport(true);
     try {
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert("Location needed", "A report is pinned to where you are, so location access is required.");
+        return;
+      }
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       const res = await post("/api/safety/reports", {
         category: reportCategory,
-        latitude: coords.latitude,
-        longitude: coords.longitude,
+        latitude: pos.coords.latitude,
+        longitude: pos.coords.longitude,
         description: reportDesc.trim() || undefined,
       });
-
       if (res.data) {
-        Alert.alert(
-          "Report Submitted",
-          "Your community safety concern has been recorded and will inform safety evaluations for fellow commuters."
-        );
+        Alert.alert("Report submitted", "Thank you. Reports near a route lower its safety score for other SafeHer users.");
         setShowReportCard(false);
         setReportDesc("");
       } else {
@@ -304,107 +249,61 @@ export default function SafestRouteScreen() {
 
   const selectedRoute = routes.find((r) => r.routeId === selectedRouteId) || routes[0];
 
+  const renderSuggestions = (list: PlaceResult[], field: "origin" | "dest") =>
+    activeSearchField === field && list.length > 0 ? (
+      <View style={routeStyles.suggestionsContainer}>
+        {list.map((item) => (
+          <TouchableOpacity key={item.placeId} style={routeStyles.suggestionItem} onPress={() => selectPlace(item, field)}>
+            <Text style={routeStyles.suggestionName}>{item.name}</Text>
+            <Text style={routeStyles.suggestionDetails} numberOfLines={1}>
+              {item.displayName}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    ) : null;
+
   return (
     <ScrollView style={themeStyles.safe} contentContainerStyle={themeStyles.scrollContent}>
       <Header
-        title="India-Wide Safest Route"
-        subtitle="Universal safety routing across India. Enter ANY start and destination to compare routes by illumination, police reach, and crime statistics."
+        title="Safest Route"
+        subtitle="Any start and destination in India. Compare real routes by police reach, nearby help and street lighting."
       />
 
-      {/* ─── 1. ORIGIN & DESTINATION SEARCH BAR ─── */}
+      {/* ─── 1. START, DESTINATION, MODE ─── */}
       <Card>
-        <Text style={themeStyles.h3}>Origin & Destination (Pan-India)</Text>
-
-        {/* Origin Input (Fully Editable or 1-tap GPS) */}
         <View style={routeStyles.inputRow}>
           <Text style={{ fontSize: 16 }}>📍</Text>
           <TextInput
             style={[themeStyles.input, { flex: 1, marginBottom: 0 }]}
-            placeholder="Starting from (e.g. Pune, Hauz Khas, My GPS)"
+            placeholder="Starting from (place in India or use GPS)"
             value={originText}
-            onChangeText={searchOriginPlaces}
+            onChangeText={(t) => void searchPlaces(t, "origin")}
           />
-          <TouchableOpacity style={routeStyles.gpsBtn} onPress={detectLocation}>
+          <TouchableOpacity style={routeStyles.gpsBtn} onPress={() => void detectLocation()}>
             <Text style={routeStyles.gpsBtnText}>📍 GPS</Text>
           </TouchableOpacity>
         </View>
+        {renderSuggestions(originSuggestions, "origin")}
 
-        {/* Origin Autocomplete Suggestions */}
-        {activeSearchField === "origin" && originSuggestions.length > 0 && (
-          <View style={routeStyles.suggestionsContainer}>
-            {originSuggestions.map((item) => (
-              <TouchableOpacity
-                key={item.placeId}
-                style={routeStyles.suggestionItem}
-                onPress={() => selectOrigin(item)}
-              >
-                <Text style={routeStyles.suggestionName}>{item.name}</Text>
-                <Text style={routeStyles.suggestionDetails} numberOfLines={1}>
-                  {item.displayName}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
-
-        {/* Destination Input (Takes ANY location in India) */}
         <View style={[routeStyles.inputRow, { marginTop: 8 }]}>
           <Text style={{ fontSize: 16 }}>🏁</Text>
           <TextInput
             style={[themeStyles.input, { flex: 1, marginBottom: 0 }]}
-            placeholder="Destination in India (any city, area, landmark)"
+            placeholder="Destination — city, town, village, area or landmark"
             value={destinationText}
-            onChangeText={searchDestPlaces}
+            onChangeText={(t) => void searchPlaces(t, "dest")}
             onSubmitEditing={() => void findSafestRoutes()}
           />
-          {searching && activeSearchField === "dest" && (
-            <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 6 }} />
-          )}
+          {searching && <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 6 }} />}
         </View>
+        {renderSuggestions(destSuggestions, "dest")}
 
-        {/* Destination Autocomplete Suggestions */}
-        {activeSearchField === "dest" && destSuggestions.length > 0 && (
-          <View style={routeStyles.suggestionsContainer}>
-            {destSuggestions.map((item) => (
-              <TouchableOpacity
-                key={item.placeId}
-                style={routeStyles.suggestionItem}
-                onPress={() => selectDestination(item)}
-              >
-                <Text style={routeStyles.suggestionName}>{item.name}</Text>
-                <Text style={routeStyles.suggestionDetails} numberOfLines={1}>
-                  {item.displayName}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        )}
-
-        {/* Quick Indian Metros Shortcuts */}
-        <Text style={[themeStyles.caption, { marginTop: 10, fontWeight: "600" }]}>Quick Pan-India Hubs:</Text>
+        <Text style={[themeStyles.caption, { marginTop: 12, fontWeight: "700" }]}>Travelling by</Text>
         <View style={routeStyles.quickTags}>
-          {[
-            { label: "Pune", lat: 18.5204, lng: 73.8567 },
-            { label: "Mumbai Bandra", lat: 19.0552, lng: 72.8347 },
-            { label: "Delhi Connaught Pl", lat: 28.6328, lng: 77.2197 },
-            { label: "Bengaluru Koramangala", lat: 12.9352, lng: 77.6245 },
-            { label: "Hyderabad Banjara", lat: 17.4156, lng: 78.4357 },
-            { label: "Chennai T. Nagar", lat: 13.0418, lng: 80.2341 },
-            { label: "Kolkata Park St", lat: 22.5518, lng: 88.3524 },
-            { label: "Jaipur Pink City", lat: 26.9157, lng: 75.8189 },
-            { label: "Chandigarh Sec 17", lat: 30.7415, lng: 76.7794 },
-            { label: "Kochi Marine Drive", lat: 9.9816, lng: 76.2799 },
-          ].map((tag) => (
-            <TouchableOpacity
-              key={tag.label}
-              style={routeStyles.tagPill}
-              onPress={() => {
-                setDestinationCoords({ latitude: tag.lat, longitude: tag.lng });
-                setDestinationText(tag.label);
-                void findSafestRoutes(tag.lat, tag.lng);
-              }}
-            >
-              <Text style={routeStyles.tagTxt}>{tag.label}</Text>
+          {(["walking", "driving"] as TravelMode[]).map((m) => (
+            <TouchableOpacity key={m} style={[routeStyles.tagPill, mode === m && routeStyles.tagPillActive]} onPress={() => setMode(m)}>
+              <Text style={[routeStyles.tagTxt, mode === m && { color: "#FFF" }]}>{m === "walking" ? "🚶 Walking" : "🚗 Car / cab / auto"}</Text>
             </TouchableOpacity>
           ))}
         </View>
@@ -412,14 +311,17 @@ export default function SafestRouteScreen() {
         <Divider />
 
         <Action
-          label={evaluating ? "Evaluating Multi-Route Safety…" : "🛡️ Calculate Safest Routes"}
+          label={evaluating ? "Checking routes…" : "🛡️ Find safest route"}
           loading={evaluating}
           disabled={evaluating || !destinationText.trim()}
           onPress={() => void findSafestRoutes()}
         />
+        {evaluating ? (
+          <Text style={[themeStyles.caption, { textAlign: "center" }]}>Looking up police stations, hospitals and transit along each route — this can take up to 20 seconds.</Text>
+        ) : null}
       </Card>
 
-      {/* ─── 2. MULTI-CORRIDOR ROUTE MAP VIEW ─── */}
+      {/* ─── 2. MAP ─── */}
       {routes.length > 0 && originCoords && destinationCoords && (
         <RouteMapView
           routes={routes}
@@ -432,173 +334,124 @@ export default function SafestRouteScreen() {
         />
       )}
 
-      {/* ─── 3. ALTERNATIVE ROUTE COMPARISON CARDS ─── */}
+      {/* ─── 3. ROUTE COMPARISON ─── */}
       {routes.length > 0 && (
         <View style={{ gap: 10 }}>
-          <Text style={[themeStyles.h2, { marginTop: 4 }]}>Alternative Corridors ({routes.length})</Text>
+          <Text style={[themeStyles.h2, { marginTop: 4 }]}>
+            {routes.length === 1 ? "Only one route found" : `${routes.length} routes compared`}
+          </Text>
 
           {routes.map((route, idx) => {
             const isSelected = route.routeId === selectedRouteId;
-            const distKm = (route.distance / 1000).toFixed(1);
-            const durMin = Math.round(route.duration / 60);
-
+            const i = route.indicators;
             return (
               <TouchableOpacity
                 key={route.routeId}
                 style={[routeStyles.routeCard, isSelected && routeStyles.routeCardActive]}
                 onPress={() => setSelectedRouteId(route.routeId)}
               >
-                {/* Header row */}
                 <View style={themeStyles.spaceBetween}>
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                    <Text style={[themeStyles.h3, isSelected && { color: colors.primary }]}>
-                      Route {idx + 1}: {route.legs?.[0]?.summary || `Corridor ${idx + 1}`}
-                    </Text>
-                  </View>
-                  <View style={{ flexDirection: "row", gap: 6 }}>
-                    {route.isRecommended && <Badge label="SAFEST ROUTE" variant="success" />}
-                    <Badge
-                      label={`${route.safetyScore}/100`}
-                      variant={route.safetyScore >= 65 ? "success" : route.safetyScore >= 45 ? "warning" : "danger"}
-                    />
-                  </View>
+                  <Text style={[themeStyles.h3, { flex: 1 }, isSelected && { color: colors.primary }]} numberOfLines={2}>
+                    Route {idx + 1}: via {route.legs?.[0]?.summary || "local roads"}
+                  </Text>
+                  <Badge label={route.safetyScore == null ? "No data" : `${route.safetyScore}/100`} variant={scoreVariant(route.safetyScore)} />
+                </View>
+                <View style={{ flexDirection: "row", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                  {route.isRecommended && <Badge label="SAFEST OF THESE" variant="success" />}
+                  {route.isFastest && <Badge label="FASTEST" variant="neutral" />}
                 </View>
 
-                {/* Distance & Time */}
                 <Text style={[themeStyles.subtitle, { marginTop: 4 }]}>
-                  🛣️ {distKm} km  •  ⏱️ ~{durMin} min  •  📊 Coverage: {route.dataCoverage}%
+                  🛣️ {(route.distance / 1000).toFixed(1)} km  •  ⏱️ ~{Math.round(route.duration / 60)} min  •  Data behind score: {route.dataCoverage}%
                 </Text>
 
-                {/* Safety Indicators Grid */}
                 <View style={routeStyles.indicatorGrid}>
                   <View style={routeStyles.indicatorItem}>
-                    <Text style={routeStyles.indicatorVal}>💡 {route.indicators.streetlightCoverage}%</Text>
-                    <Text style={routeStyles.indicatorLbl}>Lighting</Text>
+                    <Text style={routeStyles.indicatorVal}>👮 {pct(i.policeProximity)}</Text>
+                    <Text style={routeStyles.indicatorLbl}>Police reach</Text>
                   </View>
                   <View style={routeStyles.indicatorItem}>
-                    <Text style={routeStyles.indicatorVal}>👮 {route.indicators.policeProximity}%</Text>
-                    <Text style={routeStyles.indicatorLbl}>Police Reach</Text>
+                    <Text style={routeStyles.indicatorVal}>🏥 {pct(i.helpPointsCoverage)}</Text>
+                    <Text style={routeStyles.indicatorLbl}>Help within 500 m</Text>
                   </View>
                   <View style={routeStyles.indicatorItem}>
-                    <Text style={routeStyles.indicatorVal}>🛡️ {route.indicators.crimeSafetyIndex}%</Text>
-                    <Text style={routeStyles.indicatorLbl}>Crime Index</Text>
+                    <Text style={routeStyles.indicatorVal}>💡 {pct(i.streetlightCoverage)}</Text>
+                    <Text style={routeStyles.indicatorLbl}>Lit roads</Text>
                   </View>
                   <View style={routeStyles.indicatorItem}>
-                    <Text style={routeStyles.indicatorVal}>🏪 {route.indicators.populationActivity}%</Text>
-                    <Text style={routeStyles.indicatorLbl}>Activity Hubs</Text>
+                    <Text style={routeStyles.indicatorVal}>⚠️ {i.communityReports}</Text>
+                    <Text style={routeStyles.indicatorLbl}>User reports</Text>
                   </View>
                 </View>
 
-                {/* Closest police station distance */}
-                {route.indicators.closestPoliceDistM != null && (
-                  <Text style={[themeStyles.caption, { marginTop: 6, color: "#334155" }]}>
-                    🚨 Closest police facility along route: ~{route.indicators.closestPoliceDistM} m
+                {i.beyondPolice3kmPct != null && i.beyondPolice3kmPct > 0 ? (
+                  <Text style={[themeStyles.caption, { marginTop: 6, color: colors.red }]}>
+                    🚨 {i.beyondPolice3kmPct}% of this route is more than 3 km from any police station
                   </Text>
+                ) : i.farthestFromPoliceM != null ? (
+                  <Text style={[themeStyles.caption, { marginTop: 6, color: "#334155" }]}>
+                    🚨 Never more than {km(i.farthestFromPoliceM)} from a police station
+                  </Text>
+                ) : null}
+                {i.routeCheckedPct < 90 && route.safetyScore != null && (
+                  <Text style={[themeStyles.caption, { marginTop: 2 }]}>Map data reached {i.routeCheckedPct}% of this route.</Text>
                 )}
               </TouchableOpacity>
             );
           })}
+
+          {meta && (
+            <Text style={[themeStyles.caption, { marginHorizontal: 4 }]}>
+              {meta.dataSources.join(" · ")}
+            </Text>
+          )}
         </View>
       )}
 
-      {/* ─── 4. NAVIGATION LAUNCH & CONTROLS ─── */}
-      {selectedRoute && !isNavigating && (
+      {/* ─── 4. GO ─── */}
+      {selectedRoute && (
         <Card>
-          <View style={themeStyles.spaceBetween}>
-            <View>
-              <Text style={themeStyles.h3}>Selected: Route {selectedRoute.routeId}</Text>
-              <Text style={themeStyles.caption}>
-                {(selectedRoute.distance / 1000).toFixed(1)} km • {Math.round(selectedRoute.duration / 60)} min
-              </Text>
-            </View>
-            <Badge label="VERIFIED SAFE CORRIDOR" variant="success" />
-          </View>
-
-          <Divider />
-
-          <Action
-            label="🧭 Start Safest Route Navigation"
-            onPress={startNavigation}
-          />
-          <Action
-            label="🌐 Open in Google Maps"
-            secondary
-            onPress={() => {
-              if (!destinationCoords) return;
-              const origStr = originCoords ? `${originCoords.latitude},${originCoords.longitude}` : "";
-              const destStr = `${destinationCoords.latitude},${destinationCoords.longitude}`;
-              void Linking.openURL(`https://www.google.com/maps/dir/?api=1&origin=${origStr}&destination=${destStr}`);
-            }}
-          />
-        </Card>
-      )}
-
-      {/* ─── 5. ACTIVE NAVIGATION SIMULATOR SCREEN ─── */}
-      {isNavigating && selectedRoute && (
-        <Card danger>
-          <View style={themeStyles.spaceBetween}>
-            <Text style={[themeStyles.h2, { color: colors.red }]}>🧭 Active Navigation</Text>
-            <Badge label="SAFETY SHIELD ON" variant="success" />
-          </View>
-          <Text style={[themeStyles.subtitle, { marginTop: 6 }]}>
-            Destination: {destinationText}
+          <Text style={themeStyles.h3}>Route {routes.indexOf(selectedRoute) + 1} selected</Text>
+          <Text style={themeStyles.caption}>
+            {(selectedRoute.distance / 1000).toFixed(1)} km • ~{Math.round(selectedRoute.duration / 60)} min {mode === "walking" ? "walking" : "by road"}
           </Text>
-          <Text style={[themeStyles.h3, { marginTop: 6, color: "#0F172A" }]}>
-            Remaining: {(remainingDistM / 1000).toFixed(1)} km  •  ~{Math.round(remainingSec / 60)} min
-          </Text>
+          <Action label="🧭 Open directions in Google Maps" onPress={() => openInMaps(selectedRoute)} />
           <Text style={[themeStyles.caption, { marginTop: 4 }]}>
-            Route Corridor Safety Score: {selectedRoute.safetyScore}/100. Continuous GPS deviation alert is active.
+            Google Maps may adjust the exact roads. Keep SafeHer open so SOS stays one tap away.
           </Text>
-
-          <Divider />
-
-          <Action
-            label="✅ Mark Arrival at Destination"
-            onPress={() => {
-              setIsNavigating(false);
-              Alert.alert("Arrival Confirmed", "You have arrived safely at your destination. 🎉");
-            }}
-          />
-          <Action
-            label="Stop Navigation"
-            secondary
-            onPress={() => setIsNavigating(false)}
-          />
         </Card>
       )}
 
-      {/* ─── 6. CITIZEN SAFETY CONCERN REPORTING ─── */}
+      {/* ─── 5. COMMUNITY SAFETY REPORTING ─── */}
       <Card>
         <View style={themeStyles.spaceBetween}>
-          <Text style={themeStyles.h3}>⚠️ Community Safety Reporting</Text>
+          <Text style={themeStyles.h3}>⚠️ Report a safety concern here</Text>
           <TouchableOpacity onPress={() => setShowReportCard(!showReportCard)}>
             <Text style={{ color: colors.primary, fontWeight: "700", fontSize: 13 }}>
-              {showReportCard ? "Close" : "+ Report Concern"}
+              {showReportCard ? "Close" : "+ Report"}
             </Text>
           </TouchableOpacity>
         </View>
         <Text style={[themeStyles.caption, { marginTop: 2 }]}>
-          Contribute ground-truth reports regarding poor lighting, harassment spots, or deserted stretches.
+          Pinned to your current location. Hazard reports within 150 m of a route lower its score for everyone.
         </Text>
 
         {showReportCard && (
           <View style={{ marginTop: 12 }}>
-            <Text style={[themeStyles.caption, { fontWeight: "700" }]}>Issue Category:</Text>
+            <Text style={[themeStyles.caption, { fontWeight: "700" }]}>Issue category:</Text>
             <View style={routeStyles.quickTags}>
               {[
-                { id: "poor_lighting", label: "💡 Broken/Poor Lighting" },
-                { id: "harassment_hotspot", label: "🚨 Harassment Hotspot" },
-                { id: "deserted_stretch", label: "⚠️ Deserted / Isolated Road" },
-                { id: "safe_haven", label: "🏪 Safe Haven / 24-7 Active" },
+                { id: "poor_lighting", label: "💡 Broken/poor lighting" },
+                { id: "harassment_hotspot", label: "🚨 Harassment hotspot" },
+                { id: "deserted_stretch", label: "⚠️ Deserted / isolated road" },
+                { id: "safe_haven", label: "🏪 Safe haven / open 24×7" },
               ].map((c) => (
                 <TouchableOpacity
                   key={c.id}
                   style={[routeStyles.tagPill, reportCategory === c.id && routeStyles.tagPillActive]}
                   onPress={() => setReportCategory(c.id)}
                 >
-                  <Text style={[routeStyles.tagTxt, reportCategory === c.id && { color: "#FFF" }]}>
-                    {c.label}
-                  </Text>
+                  <Text style={[routeStyles.tagTxt, reportCategory === c.id && { color: "#FFF" }]}>{c.label}</Text>
                 </TouchableOpacity>
               ))}
             </View>
@@ -611,19 +464,16 @@ export default function SafestRouteScreen() {
             />
 
             <Action
-              label={submittingReport ? "Submitting…" : "Submit Safety Report"}
+              label={submittingReport ? "Submitting…" : "Submit safety report"}
               loading={submittingReport}
-              onPress={submitSafetyReport}
+              onPress={() => void submitSafetyReport()}
             />
           </View>
         )}
       </Card>
 
-      {/* Attribution & Legal Transparency */}
-      {evaluationMeta ? (
-        <Text style={[themeStyles.caption, { textAlign: "center", marginHorizontal: 12, marginTop: 4 }]}>
-          {evaluationMeta}
-        </Text>
+      {meta?.disclaimer ? (
+        <Text style={[themeStyles.caption, { textAlign: "center", marginHorizontal: 12, marginTop: 4 }]}>{meta.disclaimer}</Text>
       ) : null}
 
       <Action label="← Back Home" secondary onPress={() => router.back()} />

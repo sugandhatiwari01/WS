@@ -53,6 +53,13 @@
           "enableBackgroundRecording": false
         }
       ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "SAFEHER takes photos during an active SOS and shares them with police and your linked family.",
+          "recordAudioAndroid": false
+        }
+      ],
       "expo-status-bar",
       "expo-web-browser",
       "expo-asset"

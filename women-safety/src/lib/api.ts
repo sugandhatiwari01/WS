@@ -1,7 +1,8 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
+import { blobFromLocalUri, readLocalFileBase64 } from "@/lib/native-file";
 
-const API_URL = (process.env.EXPO_PUBLIC_API_URL || "").replace(/\/$/, "");
+import { API_URL } from "@/lib/api-url";
 const TOKEN_KEY = "women-safety-token";
 const QUEUE_KEY = "women-safety-api-queue";
 
@@ -88,92 +89,66 @@ export function del<T>(path: string) {
   return api<T>(path, { method: "DELETE" });
 }
 
-/** Multipart audio upload */
-export async function uploadAudio<T>(path: string, uri: string): Promise<ApiResult<T>> {
+/** Multipart upload of a local file (native file:// URI) or a web blob:/data: URI. */
+async function uploadFile<T>(
+  path: string,
+  uri: string,
+  field: string,
+  filename: string,
+  failureMessage: string,
+): Promise<ApiResult<T>> {
   if (!API_URL) return { offline: true, error: "Backend URL is not configured." };
   const token = await getToken();
-  const form = new FormData();
-  const filename = `evidence-${Date.now()}.m4a`;
-
-  try {
-    if (Platform.OS === "web" || uri.startsWith("blob:") || uri.startsWith("data:") || uri.startsWith("http")) {
-      // In Web / browser: fetch the blob and append actual Blob/File object
-      const blobResponse = await fetch(uri);
-      const blob = await blobResponse.blob();
-      const ext = blob.type?.includes("webm") ? "webm" : blob.type?.includes("ogg") ? "ogg" : "m4a";
-      form.append("audio", blob, `evidence-${Date.now()}.${ext}`);
-    } else {
-      // In Native (Android / iOS): use React Native's file descriptor object
-      form.append("audio", {
-        uri,
-        name: filename,
-        type: "audio/m4a",
-      } as unknown as Blob);
-    }
-  } catch (err) {
-    console.warn("Audio file preparation error:", err);
-    // Fallback to RN file descriptor
-    form.append("audio", {
-      uri,
-      name: filename,
-      type: "audio/m4a",
-    } as unknown as Blob);
-  }
-
-  try {
+  const isLocalFile = !(Platform.OS === "web" || uri.startsWith("blob:") || uri.startsWith("data:") || uri.startsWith("http"));
+  const send = async (body: FormData | string, json: boolean) => {
     const response = await fetch(`${API_URL}${path}`, {
       method: "POST",
-      headers: token ? { Authorization: "Bearer " + token } : {},
-      body: form,
+      headers: {
+        ...(token ? { Authorization: "Bearer " + token } : {}),
+        ...(json ? { "Content-Type": "application/json" } : {}),
+      },
+      body,
     });
     const payload = await response.json().catch(() => undefined);
-    if (!response.ok) return { offline: false, status: response.status, error: payload?.error || `Request failed (${response.status})` };
-    return { offline: false, status: response.status, data: payload as T };
-  } catch {
-    return { offline: true, error: "Unable to upload the recording." };
+    if (!response.ok) return { offline: false, status: response.status, error: payload?.error || `Upload failed (${response.status})` } as ApiResult<T>;
+    return { offline: false, status: response.status, data: payload as T } as ApiResult<T>;
+  };
+
+  // 1) Multipart upload.
+  let multipartError: unknown;
+  try {
+    const form = new FormData();
+    if (isLocalFile) form.append(field, blobFromLocalUri(uri), filename);
+    else form.append(field, await (await fetch(uri)).blob(), filename);
+    return await send(form, false);
+  } catch (err) {
+    multipartError = err;
+    console.warn(`Multipart ${field} upload failed:`, err);
   }
+
+  // 2) On the phone, fall back to a plain JSON request with the file as base64 —
+  //    the same kind of request that location updates use.
+  if (isLocalFile) {
+    try {
+      const fileBase64 = await readLocalFileBase64(uri);
+      return await send(JSON.stringify({ fileBase64, filename }), true);
+    } catch (err) {
+      console.warn(`Base64 ${field} upload failed:`, err);
+      return { offline: true, error: `${failureMessage} (${err instanceof Error ? err.message : String(err)})` };
+    }
+  }
+  return { offline: true, error: `${failureMessage} (${multipartError instanceof Error ? multipartError.message : String(multipartError)})` };
+}
+
+/** Multipart audio upload */
+export function uploadAudio<T>(path: string, uri: string) {
+  const ext = uri.match(/\.(m4a|mp4|aac|3gp|webm|ogg|wav|caf)$/i)?.[1]?.toLowerCase() ?? "m4a";
+  return uploadFile<T>(path, uri, "audio", `evidence-${Date.now()}.${ext}`, "Unable to upload the recording.");
 }
 
 /** Multipart photo upload */
-export async function uploadPhoto<T>(path: string, uri: string): Promise<ApiResult<T>> {
-  if (!API_URL) return { offline: true, error: "Backend URL is not configured." };
-  const token = await getToken();
-  const form = new FormData();
-  const filename = `proof-${Date.now()}.jpg`;
-
-  try {
-    if (Platform.OS === "web" || uri.startsWith("blob:") || uri.startsWith("data:") || uri.startsWith("http")) {
-      const blobResponse = await fetch(uri);
-      const blob = await blobResponse.blob();
-      form.append("photo", blob, filename);
-    } else {
-      form.append("photo", {
-        uri,
-        name: filename,
-        type: "image/jpeg",
-      } as unknown as Blob);
-    }
-  } catch (err) {
-    console.warn("Photo file preparation error:", err);
-    form.append("photo", {
-      uri,
-      name: filename,
-      type: "image/jpeg",
-    } as unknown as Blob);
-  }
-
-  try {
-    const response = await fetch(`${API_URL}${path}`, {
-      method: "POST",
-      headers: token ? { Authorization: "Bearer " + token } : {},
-      body: form,
-    });
-    const payload = await response.json().catch(() => undefined);
-    if (!response.ok) return { offline: false, status: response.status, error: payload?.error || `Photo upload failed (${response.status})` };
-    return { offline: false, status: response.status, data: payload as T };
-  } catch {
-    return { offline: true, error: "Unable to upload the photo." };
-  }
+export function uploadPhoto<T>(path: string, uri: string) {
+  return uploadFile<T>(path, uri, "photo", `photo-${Date.now()}.jpg`, "Unable to upload the photo.");
 }
 
 /** Retry queued offline requests */

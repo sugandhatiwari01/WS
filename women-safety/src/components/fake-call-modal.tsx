@@ -1,7 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Modal, Platform, Pressable, StyleSheet, Text, Vibration, View } from "react-native";
 import * as Speech from "expo-speech";
+import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from "expo-audio";
 import { colors } from "@/lib/theme";
+
+const RINGTONE = require("../../assets/sounds/ringtone.wav");
 
 type FakeCallModalProps = {
   visible: boolean;
@@ -19,20 +22,51 @@ export default function FakeCallModal({
   const [callState, setCallState] = useState<"ringing" | "connected">("ringing");
   const [callSeconds, setCallSeconds] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Original synthesised ringtone (see scripts/generate-ringtone.js), looped while ringing.
+  // Created on first ring, not during render, so the web build's server-side render never touches audio.
+  const ringtoneRef = useRef<AudioPlayer | null>(null);
 
-  // Handle ringing vibration
+  // Handle ringing vibration + ringtone
   useEffect(() => {
-    if (visible && callState === "ringing") {
+    const ringing = visible && callState === "ringing";
+    let stopped = false;
+    if (ringing) {
       if (Platform.OS !== "web") {
         Vibration.vibrate([0, 1000, 1000], true);
       }
+      // Ring even when the phone is on silent, like a real incoming call screen.
+      setAudioModeAsync({ playsInSilentMode: true })
+        .catch(() => undefined)
+        .finally(() => {
+          if (stopped) return;
+          try {
+            if (!ringtoneRef.current) ringtoneRef.current = createAudioPlayer(RINGTONE);
+            const ringtone = ringtoneRef.current;
+            ringtone.loop = true;
+            ringtone.volume = 1;
+            void ringtone.seekTo(0);
+            ringtone.play();
+          } catch (_) {}
+        });
     } else {
       Vibration.cancel();
     }
     return () => {
+      stopped = true;
       Vibration.cancel();
+      try {
+        ringtoneRef.current?.pause();
+      } catch (_) {}
     };
   }, [visible, callState]);
+
+  // Free the audio player when the call screen goes away.
+  useEffect(() => () => {
+    try {
+      ringtoneRef.current?.remove();
+    } catch (_) {}
+    ringtoneRef.current = null;
+  }, []);
 
   // Handle connected call timer & speech
   useEffect(() => {

@@ -10,6 +10,8 @@ import { api, post, uploadAudio } from "@/lib/api";
 import { useSos } from "@/hooks/useSos";
 import { useSocket } from "@/hooks/useSocket";
 import FakeCallModal from "@/components/fake-call-modal";
+import SosEvidenceCamera from "@/components/sos-evidence-camera";
+import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import LiveMapView, { PoliceStationMarker } from "@/components/live-map-view";
 import { colors, styles } from "@/lib/theme";
 
@@ -22,6 +24,12 @@ type IncomingEmergency = {
 
 type SafetyHealth = { ok?: boolean; sms?: boolean; voice?: boolean };
 type PendingAudio = { uri: string; emergencyId: string };
+
+/** Automatic SOS audio: AUTO_CLIPS clips of AUTO_CLIP_MS, each starting AUTO_INTERVAL_MS after the previous one. */
+const AUTO_CLIPS = 3;
+const AUTO_CLIP_MS = 30_000;
+const AUTO_INTERVAL_MS = 60_000;
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export default function Home() {
   const { user, signOut } = useAuth();
@@ -43,7 +51,12 @@ export default function Home() {
   const [fakeCallModalVisible, setFakeCallModalVisible] = useState(false);
   const [audioUploading, setAudioUploading] = useState(false);
   const [pendingAudio, setPendingAudio] = useState<PendingAudio | null>(null);
+  const [autoRecording, setAutoRecording] = useState(false);
+  const [autoStatus, setAutoStatus] = useState<string | null>(null);
   const [nearbyStations, setNearbyStations] = useState<PoliceStationMarker[]>([]);
+  const [stationRadiusKm, setStationRadiusKm] = useState(5);
+  const [stationsLoading, setStationsLoading] = useState(false);
+  const [stationsError, setStationsError] = useState<string | null>(null);
   const [userCoords, setUserCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const [showMap, setShowMap] = useState(false);
   const [readiness, setReadiness] = useState({
@@ -112,29 +125,42 @@ export default function Home() {
     },
   });
 
-  const loadNearbyStations = useCallback(async () => {
+  /** Real police stations (OpenStreetMap) within the chosen radius of the user's GPS position. */
+  const loadNearbyStations = useCallback(async (radiusKm: number) => {
+    setStationsLoading(true);
     try {
-      let lat: number | undefined;
-      let lng: number | undefined;
       const perm = await Location.getForegroundPermissionsAsync();
-      if (perm.granted) {
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-        lat = pos.coords.latitude;
-        lng = pos.coords.longitude;
-        setUserCoords({ latitude: lat, longitude: lng });
+      if (!perm.granted) {
+        setUserCoords(null);
+        setNearbyStations([]);
+        return;
       }
-      const queryParam = lat != null && lng != null ? `?latitude=${lat}&longitude=${lng}` : "";
-      const result = await api<PoliceStationMarker[]>(`/api/police/stations${queryParam}`);
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const { latitude, longitude } = pos.coords;
+      setUserCoords({ latitude, longitude });
+      const result = await api<PoliceStationMarker[]>(
+        `/api/police/stations?latitude=${latitude}&longitude=${longitude}&radiusKm=${radiusKm}`
+      );
       if (result.data) {
         setNearbyStations(result.data);
+        setStationsError(null);
+      } else {
+        setStationsError(result.error || "Could not look up nearby police stations. Call 112 in an emergency.");
       }
-    } catch (_) {}
+    } catch (e) {
+      setStationsError(e instanceof Error ? e.message : "Could not get your location.");
+    } finally {
+      setStationsLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void Promise.resolve().then(() => loadNearbyStations(stationRadiusKm));
+  }, [loadNearbyStations, stationRadiusKm]);
 
   /* ─── Init ─────────────────────────────────────────────── */
   useEffect(() => {
     void Promise.resolve().then(checkReadiness);
-    void loadNearbyStations();
 
     // Load incoming family alerts via polling fallback (also updated via socket)
     const loadIncoming = async () => {
@@ -147,7 +173,7 @@ export default function Home() {
     return () => {
       clearInterval(pollTimer);
     };
-  }, [checkReadiness, loadNearbyStations]);
+  }, [checkReadiness]);
 
   /* ─── SOS button press ─────────────────────────────────── */
   const handleSosPress = () => {
@@ -175,7 +201,17 @@ export default function Home() {
     }
   };
 
-  /* ─── Automated 10-second audio recording when SOS triggers ─── */
+  /* ─── Keep the screen on during SOS so live location and photos keep flowing ─── */
+  useEffect(() => {
+    if (sosState !== "active" || Platform.OS === "web") return;
+    const tag = "sos-active";
+    activateKeepAwakeAsync(tag).catch(() => undefined);
+    return () => {
+      try { deactivateKeepAwake(tag); } catch { /* already released */ }
+    };
+  }, [sosState]);
+
+  /* ─── Automatic SOS audio: 3 × 30 s clips, one minute apart ─── */
   const autoRecordedEmergencyId = useRef<string | null>(null);
 
   useEffect(() => {
@@ -187,48 +223,68 @@ export default function Home() {
     autoRecordedEmergencyId.current = emergencyId;
 
     let cancelled = false;
-    const startAutoRecord = async () => {
-      try {
-        const permission = await requestRecordingPermissionsAsync();
-        if (!permission.granted || cancelled) return;
-        // Use the dedicated auto-recorder (never conflicts with manual recording)
-        await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-        await autoRecorder.prepareToRecordAsync();
-        autoRecorder.record();
-
-        setTimeout(async () => {
-          if (cancelled) return;
-          try {
-            await autoRecorder.stop();
-            await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
-            const uri = autoRecorder.uri;
-            if (uri && !cancelled) {
-              await uploadRecording(uri);
-            }
-          } catch (e) {
-            console.warn("Auto recording finish error:", e);
-          }
-        }, 10_000);
-      } catch (e) {
-        console.warn("Auto recording start error:", e);
+    let recording = false;
+    const run = async () => {
+      const permission = await requestRecordingPermissionsAsync().catch(() => null);
+      if (cancelled) return;
+      if (!permission?.granted) {
+        setAutoStatus("Microphone permission is off, so automatic recording was skipped.");
+        return;
       }
+      setAutoRecording(true);
+      let sent = 0;
+      for (let clip = 1; clip <= AUTO_CLIPS && !cancelled; clip++) {
+        const clipStarted = Date.now();
+        try {
+          setAutoStatus(`● Recording clip ${clip} of ${AUTO_CLIPS} (${AUTO_CLIP_MS / 1000}s)…`);
+          await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+          await autoRecorder.prepareToRecordAsync();
+          autoRecorder.record();
+          recording = true;
+          await wait(AUTO_CLIP_MS);
+          if (cancelled) break;
+          await autoRecorder.stop();
+          recording = false;
+          const uri = autoRecorder.uri;
+          setAutoStatus(`Uploading clip ${clip} of ${AUTO_CLIPS}…`);
+          // Only the first clip texts family, so one SOS doesn't send three messages.
+          const ok = uri ? await uploadRecording(uri, { automatic: true, notify: clip === 1 }) : false;
+          if (ok) sent += 1;
+          setAutoStatus(ok ? `Clip ${clip} of ${AUTO_CLIPS} sent to police and family.` : `Clip ${clip} of ${AUTO_CLIPS} could not be sent — saved on this device.`);
+        } catch (e) {
+          recording = false;
+          setAutoStatus(`Clip ${clip} of ${AUTO_CLIPS} failed: ${e instanceof Error ? e.message : "microphone error"}`);
+        }
+        if (clip < AUTO_CLIPS && !cancelled) {
+          const remaining = AUTO_INTERVAL_MS - (Date.now() - clipStarted);
+          if (remaining > 0) await wait(remaining);
+        }
+      }
+      try {
+        await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+      } catch (_) {}
+      if (cancelled) return;
+      setAutoRecording(false);
+      setAutoStatus(`Automatic recording finished — ${sent} of ${AUTO_CLIPS} clips sent. You can record more below.`);
     };
 
-    const timer = setTimeout(() => {
-      void startAutoRecord();
-    }, 600);
-
+    const timer = setTimeout(() => void run(), 600);
     return () => {
       cancelled = true;
       clearTimeout(timer);
+      if (recording) autoRecorder.stop().catch(() => undefined);
+      setAutoRecording(false);
+      setAutoStatus(null);
     };
   }, [sosState, emergencyId]);
 
   /* ─── Audio recording ──────────────────────────────────── */
-  const uploadRecording = async (uri: string) => {
+  /** Uploads a recording to the active incident. Automatic clips report in the SOS card instead of pop-ups. Returns true on success. */
+  const uploadRecording = async (uri: string, options: { automatic?: boolean; notify?: boolean } = {}): Promise<boolean> => {
+    const { automatic = false, notify = true } = options;
     if (!emergencyId) {
-      Alert.alert("Recording not uploaded", "There is no active server incident to attach this recording to. Start an SOS before recording.");
-      return;
+      if (!automatic) Alert.alert("Recording not uploaded", "There is no active server incident to attach this recording to. Start an SOS before recording.");
+      return false;
     }
     const pending = { uri, emergencyId };
     setPendingAudio(pending);
@@ -243,11 +299,13 @@ export default function Home() {
     try {
       const result = await uploadAudio<{ url?: string }>(`/api/emergencies/${emergencyId}/audio`, uri);
       if (result.error) {
-        Alert.alert(
-          "Audio upload failed",
-          `The recording is saved on this device but is not available in the police dashboard yet. ${result.error}`
-        );
-        return;
+        if (!automatic) {
+          Alert.alert(
+            "Audio upload failed",
+            `The recording is saved on this device but is not available in the police dashboard yet. ${result.error}`
+          );
+        }
+        return false;
       }
       setPendingAudio(null);
       let cleanupWarning = "";
@@ -260,18 +318,24 @@ export default function Home() {
             : " Its local retry marker could not be removed.";
         }
       }
-      Alert.alert(
-        "Audio shared with dispatch",
-        `The recording is attached to this incident and can be reviewed from the police dashboard.${cleanupWarning}`
-      );
-      // Automatically send audio alert SMS & socket broadcast to family and police
-      void post("/api/notify/audio-alert", {
-        emergencyId,
-        userName: user?.name,
-        audioUrl: result.data?.url,
-      });
+      if (!automatic) {
+        Alert.alert(
+          "Audio shared with dispatch",
+          `The recording is attached to this incident and can be reviewed from the police dashboard.${cleanupWarning}`
+        );
+      }
+      // Send audio alert SMS & socket broadcast to family and police
+      if (notify) {
+        void post("/api/notify/audio-alert", {
+          emergencyId,
+          userName: user?.name,
+          audioUrl: result.data?.url,
+        });
+      }
+      return true;
     } catch (error) {
-      Alert.alert("Audio upload failed", error instanceof Error ? error.message : "The recording is still saved on this device.");
+      if (!automatic) Alert.alert("Audio upload failed", error instanceof Error ? error.message : "The recording is still saved on this device.");
+      return false;
     } finally {
       setAudioUploading(false);
     }
@@ -413,6 +477,15 @@ export default function Home() {
         />
       </Card>
 
+      {/* Family dashboard — any account that someone added as a trusted contact */}
+      <Card>
+        <Text style={styles.h3}>👪 Family dashboard</Text>
+        <Text style={[styles.subtitle, { marginTop: 4 }]}>
+          See live SOS alerts, location, audio and photos from people who added you as a trusted contact.
+        </Text>
+        <Action label="Open family dashboard" secondary onPress={() => router.push("/family" as never)} />
+      </Card>
+
       {/* Incoming family alerts */}
       {incomingAlerts.length > 0 && (
         <StatusBanner
@@ -429,7 +502,7 @@ export default function Home() {
           <Text style={[styles.h2, { color: colors.red }]}>🚨 SOS Active — {elapsedLabel}</Text>
           <Text style={[styles.subtitle, { marginTop: 6 }]}>📍 {locationStr}</Text>
           <Text style={[styles.caption, { marginTop: 6 }]}>
-            Location updates are attempted while SafeHer is open; this is not background tracking.
+            Live location is shared every few seconds while SafeHer is open. The screen stays on during SOS — keep the app open.
           </Text>
           {nearbyStation?.name && (
             <Text style={[styles.caption, { marginTop: 4 }]}>
@@ -438,18 +511,31 @@ export default function Home() {
           )}
           <Divider />
           <Text style={[styles.caption, { marginTop: 6 }]}>
-            Audio is recorded only when you start it. The microphone indicator stays visible while recording.
+            SOS records {AUTO_CLIPS} clips of {AUTO_CLIP_MS / 1000}s, one minute apart, and shares them with police and family. The microphone indicator stays visible while recording.
           </Text>
+          {autoStatus ? (
+            <Text accessibilityLiveRegion="polite" style={[styles.h3, { color: autoRecording ? colors.red : colors.ink, marginTop: 8 }]}>
+              {autoStatus}
+            </Text>
+          ) : null}
           {recorderState.isRecording ? (
             <Text accessibilityLiveRegion="polite" style={[styles.h3, { color: colors.red, marginTop: 8 }]}>
               ● Recording surroundings · {Math.floor(recorderState.durationMillis / 1000)}s
             </Text>
           ) : null}
           <Action
-            label={audioUploading ? "Uploading audio…" : recorderState.isRecording ? "⏹ Stop & upload recording" : "🎙 Record surroundings"}
+            label={
+              autoRecording
+                ? "Automatic recording in progress…"
+                : audioUploading
+                  ? "Uploading audio…"
+                  : recorderState.isRecording
+                    ? "⏹ Stop & upload recording"
+                    : "🎙 Record surroundings"
+            }
             secondary
-            loading={audioUploading}
-            disabled={audioUploading}
+            loading={audioUploading && !autoRecording}
+            disabled={audioUploading || autoRecording}
             onPress={() => void toggleRecording()}
           />
           {pendingAudio?.emergencyId === emergencyId ? (
@@ -465,6 +551,12 @@ export default function Home() {
             <Text style={styles.caption}>
               This recording is on this device only until its upload succeeds. Police cannot review it yet.
             </Text>
+          ) : null}
+          {emergencyId ? (
+            <>
+              <Divider />
+              <SosEvidenceCamera emergencyId={emergencyId} />
+            </>
           ) : null}
           {nearbyStation?.location?.coordinates && (
             <Action
@@ -538,8 +630,10 @@ export default function Home() {
         </View>
         <Text style={[styles.subtitle, { marginTop: 6 }]}>
           {nearbyStations.length > 0
-            ? `Nearest: ${nearbyStations[0].name} (${nearbyStations[0].distanceKm ?? 0.8} km away). Track your live position, compass, and nearest police stations.`
-            : "Locate nearby police outposts and track your live GPS position on an interactive radar map."}
+            ? `Nearest: ${nearbyStations[0].name}${nearbyStations[0].distanceKm != null ? ` (${nearbyStations[0].distanceKm.toFixed(1)} km away)` : ""}. Real stations from OpenStreetMap.`
+            : userCoords && !stationsLoading && !stationsError
+              ? `No police stations listed within ${stationRadiusKm} km. Open the map to widen the search, or call 112.`
+              : "Find real police stations near you and the official helpline numbers."}
         </Text>
 
         <Action
@@ -553,7 +647,11 @@ export default function Home() {
             <LiveMapView
               userLocation={userCoords}
               policeStations={nearbyStations}
-              onRefresh={loadNearbyStations}
+              onRefresh={() => void loadNearbyStations(stationRadiusKm)}
+              loading={stationsLoading}
+              radiusKm={stationRadiusKm}
+              onRadiusChange={setStationRadiusKm}
+              error={stationsError}
             />
           </View>
         )}
@@ -591,19 +689,6 @@ export default function Home() {
           label="Manage trusted contacts"
           secondary
           onPress={() => router.push("/contacts" as never)}
-        />
-      </Card>
-
-      <Card>
-        <Text style={styles.h2}>Walk With Me</Text>
-        <Text style={[styles.subtitle, { marginTop: 6 }]}>
-          Real-time GPS route tracking. Get automatic alerts to contacts if you deviate from your path
-          or stop unexpectedly for more than 3 minutes.
-        </Text>
-        <Action
-          label="Start a walk"
-          secondary
-          onPress={() => router.push("/ride" as never)}
         />
       </Card>
 
